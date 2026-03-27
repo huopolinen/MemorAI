@@ -1,74 +1,97 @@
-<img width="1408" height="768" alt="image" src="https://github.com/user-attachments/assets/95171c46-2717-4b21-91ad-2ae2d5622964" />
+# MemorAI
 
-# AutoRec
+Remembers everything you do on your computer for AI.
 
-Your calls are data. Don't lose them.
-
-Every meeting, every negotiation, every support call — it's raw material for training models, building knowledge bases, and extracting insights. The problem is that this data evaporates the moment you hang up. AutoRec fixes that: it sits in your menu bar, detects calls automatically, and silently records everything — system audio, your microphone, and optionally your screen. After the call ends, it transcribes locally via whisper.cpp. No cloud, no subscriptions, no data leaving your machine. Just structured, searchable recordings accumulating on your disk, ready for whatever you build next.
+MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Everything stays local on your machine: screenshots are OCR'd via Apple Vision, calls are transcribed via whisper.cpp. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
 
 ## Features
 
-- **Auto-detection** — monitors mic usage, starts recording the moment a call begins (Zoom, Teams, FaceTime, etc.)
-- **Dual-track audio** — system audio (what you hear) and microphone (what you say) as separate files
-- **Screen recording** — optional 10 fps H.264 capture, toggled from the menu
-- **Local transcription** — whisper.cpp runs on your machine after each call, no API keys needed
-- **Efficient codecs** — HE-AAC keeps files small (~5 MB/hour per track) while staying clear enough for speech recognition
-- **Zero friction** — menu bar dot: gray = idle, red = recording. That's it.
+### Screen Memory
+- **Periodic screenshots** — captures screen every N seconds (configurable 1–30s)
+- **Smart change detection** — only saves when something actually changed (perceptual hash)
+- **OCR** — Apple Vision extracts text from every screenshot (Russian + English)
+- **Structured extraction** — URLs, emails, phone numbers parsed from OCR text
+- **Metadata** — active app, window title, browser URL saved with each capture
+- **App exclusions** — skip recording for specific apps (Telegram, YouTube, etc.)
 
-## Build & Install
+### Clipboard History
+- **Auto-capture** — saves every clipboard change (text, images, URLs, files)
+- **Menu bar access** — last 100 entries in a dropdown, click to re-copy
+- **Image previews** — thumbnails for screenshot/image clipboard entries
+- **Persistent** — survives app restarts, stored as JSONL
+
+### Call Recording
+- **Auto-detection** — monitors mic usage, starts recording when a call begins (Zoom, Teams, FaceTime, etc.)
+- **Dual-track audio** — system audio + microphone as separate files
+- **Screen recording** — optional 10 fps H.264 capture during calls
+- **Local transcription** — whisper.cpp transcribes after each call, no cloud needed
+- **Efficient codecs** — HE-AAC keeps files small (~5 MB/hour per track)
+
+### General
+- **Menu bar only** — colored dot: gray = idle, red = recording call
+- **CLI tool** — `memorai` command for status, history, settings
+- **All local** — nothing leaves your machine
+
+## Build & Run
 
 ```bash
-git clone https://github.com/huopolinen/AutoRec.git
-cd AutoRec
-bash build-app.sh
-cp -r AutoRec.app /Applications/
+cd side-projects/memorAI
+bash bundle.sh
+open MemorAI.app
 ```
 
-macOS 13+ required. On first launch, grant **Microphone** and **Screen Recording** permissions.
+macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**, and **Accessibility** permissions.
 
-## Usage
+## CLI
 
-Click the menu bar icon:
+```bash
+./memorai status              # app status, settings, today's stats
+./memorai screenshots [date]  # list captures for a day
+./memorai clipboard [count]   # show clipboard history
+./memorai ocr [date] [count]  # show OCR text from screenshots
+./memorai set <key> <value>   # change settings
+./memorai exclude add|remove|list  # manage excluded apps
+./memorai start|stop|restart  # control the app
+```
 
-- **Start/Stop Recording** — manual control
-- **Pause/Resume** — mid-call pause
-- **Auto-detect Calls** — fire-and-forget mode
-- **Record Screen** — toggle screen capture
-- **Auto-transcribe** — toggle post-call whisper.cpp transcription
-- **Output folder** — choose where recordings land
+## Menu Bar
 
-Default output: `~/Downloads/AutoRec/`
+- Start/Stop/Pause call recording
+- Auto-detect Calls (on/off)
+- Record Screen during calls (on/off)
+- Auto-transcribe via Whisper (on/off)
+- Screen Memory (on/off)
+- Save Clipboard (on/off)
+- Clipboard History (last 100 entries)
+- Excluded Apps (add/remove from running apps)
+- Output folder selection
 
-| File | Contents |
-|------|----------|
-| `call_<timestamp>_system.m4a` | System audio (their voice) |
-| `call_<timestamp>_mic.m4a` | Microphone (your voice) |
-| `call_<timestamp>_screen.mp4` | Screen recording (if enabled) |
-| `call_<timestamp>_transcript.txt` | Transcription (if enabled) |
+## Data Structure
 
-## Audio Quality
+```
+~/Downloads/MemorAI/
+  memorai.log                        # app log
+  clipboard.jsonl                    # clipboard history
+  screen/
+    2026-03-22/
+      14-30-05.jpg                   # screenshot
+      14-30-05.json                  # {app, window_title, ocr_text, urls, ...}
+  call_<timestamp>_system.m4a       # system audio
+  call_<timestamp>_mic.m4a          # microphone
+  call_<timestamp>_screen.mp4       # screen (if enabled)
+  call_<timestamp>_transcript.txt   # transcription (if enabled)
+```
 
-| Track | Codec | Sample Rate | Bitrate |
-|-------|-------|-------------|---------|
-| System audio | HE-AAC v1 | 48 kHz stereo | 48 kbps |
-| Microphone | HE-AAC v2 | 48 kHz mono | 32 kbps |
-
-HE-AAC uses spectral band replication — full encoding of speech frequencies, compact reconstruction of highs. The result: clear voice at a fraction of the file size compared to AAC-LC.
-
-## Transcription
+## Transcription Setup
 
 ```bash
 brew install ffmpeg whisper-cpp
-```
-
-Download a model (base multilingual covers most languages, ~150 MB):
-
-```bash
+mkdir -p ~/.local/share/whisper-models
 curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin" \
-  -o /usr/local/share/whisper-cpp/ggml-base.bin
+  -o ~/.local/share/whisper-models/ggml-base.bin
 ```
 
-AutoRec auto-detects `whisper-cli` in PATH. Transcription runs locally after each recording — no API calls, no latency, no cost.
+For better Russian recognition, use `ggml-medium.bin` instead.
 
 ## License
 

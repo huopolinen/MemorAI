@@ -41,6 +41,10 @@ class SystemAudioRecorder: NSObject {
     private var silenceStart: Date?
     private var isSilent = false
 
+    // --- Warmup: skip initial silent buffers from SCStream startup ---
+    private var audioWarmedUp = false
+    private let warmupRMSThreshold: Float = 0.0005
+
     /// If videoURL is nil, only audio is captured (no screen).
     init(audioURL: URL, videoURL: URL?) {
         self.audioURL = audioURL
@@ -50,6 +54,11 @@ class SystemAudioRecorder: NSObject {
 
     func start() async throws {
         guard !isRecording else { return }
+
+        // Reset warmup state for new recording session
+        audioWarmedUp = false
+        silenceStart = nil
+        isSilent = false
 
         try? FileManager.default.removeItem(at: audioURL)
         if let videoURL { try? FileManager.default.removeItem(at: videoURL) }
@@ -239,6 +248,17 @@ extension SystemAudioRecorder: SCStreamOutput {
         switch type {
         case .audio:
             guard let input = audioInput, input.isReadyForMoreMediaData else { return }
+
+            // Skip initial silent buffers from SCStream startup (~30s of digital silence)
+            if !audioWarmedUp {
+                let rms = bufferRMS(sampleBuffer)
+                if rms < warmupRMSThreshold {
+                    return // still warming up, discard silent buffer
+                }
+                audioWarmedUp = true
+                log("[SystemAudioRecorder] Audio warmed up (first non-silent buffer)")
+            }
+
             if !audioSessionStarted {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
                 audioWriter?.startSession(atSourceTime: pts)
@@ -296,21 +316,19 @@ extension SystemAudioRecorder: SCStreamOutput {
         }
     }
 
-    /// Compute RMS of audio buffer and track silence duration.
-    private func updateSilenceState(_ sampleBuffer: CMSampleBuffer) {
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+    /// Compute RMS of a CMSampleBuffer containing float32 audio.
+    private func bufferRMS(_ sampleBuffer: CMSampleBuffer) -> Float {
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return 0 }
         let length = CMBlockBufferGetDataLength(blockBuffer)
         var data = Data(count: length)
         data.withUnsafeMutableBytes { rawBuf in
             guard let ptr = rawBuf.baseAddress else { return }
             CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: ptr)
         }
-
-        // Compute RMS from float32 samples
         let floatCount = length / MemoryLayout<Float>.size
-        guard floatCount > 0 else { return }
-        let rms: Float = data.withUnsafeBytes { rawBuf in
-            guard let floats = rawBuf.baseAddress?.assumingMemoryBound(to: Float.self) else { return 0 }
+        guard floatCount > 0 else { return 0 }
+        return data.withUnsafeBytes { rawBuf in
+            guard let floats = rawBuf.baseAddress?.assumingMemoryBound(to: Float.self) else { return Float(0) }
             var sum: Float = 0
             for i in 0..<floatCount {
                 let s = floats[i]
@@ -318,7 +336,11 @@ extension SystemAudioRecorder: SCStreamOutput {
             }
             return sqrtf(sum / Float(floatCount))
         }
+    }
 
+    /// Track silence duration using RMS.
+    private func updateSilenceState(_ sampleBuffer: CMSampleBuffer) {
+        let rms = bufferRMS(sampleBuffer)
         let now = Date()
         if rms < silenceRMSThreshold {
             if silenceStart == nil {

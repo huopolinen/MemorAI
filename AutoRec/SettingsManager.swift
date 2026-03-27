@@ -5,46 +5,79 @@ class SettingsManager {
 
     private let defaults = UserDefaults.standard
 
-    private enum Keys {
-        static let outputPath = "outputPath"
-        static let autoDetect = "autoDetect"
-        static let recordScreen = "recordScreen"
-        static let autoTranscribe = "autoTranscribe"
-    }
+    // MARK: - Call Recording
 
     var outputPath: String {
         get {
-            defaults.string(forKey: Keys.outputPath)
-                ?? NSString("~/Downloads/AutoRec").expandingTildeInPath
+            defaults.string(forKey: "outputPath")
+                ?? NSString("~/Downloads/MemorAI").expandingTildeInPath
         }
-        set { defaults.set(newValue, forKey: Keys.outputPath) }
+        set { defaults.set(newValue, forKey: "outputPath") }
     }
 
     var autoDetect: Bool {
         get {
-            if defaults.object(forKey: Keys.autoDetect) == nil { return true }
-            return defaults.bool(forKey: Keys.autoDetect)
+            if defaults.object(forKey: "autoDetect") == nil { return true }
+            return defaults.bool(forKey: "autoDetect")
         }
-        set { defaults.set(newValue, forKey: Keys.autoDetect) }
+        set { defaults.set(newValue, forKey: "autoDetect") }
     }
 
     var recordScreen: Bool {
         get {
-            if defaults.object(forKey: Keys.recordScreen) == nil { return true }
-            return defaults.bool(forKey: Keys.recordScreen)
+            if defaults.object(forKey: "recordScreen") == nil { return true }
+            return defaults.bool(forKey: "recordScreen")
         }
-        set { defaults.set(newValue, forKey: Keys.recordScreen) }
+        set { defaults.set(newValue, forKey: "recordScreen") }
     }
 
     var autoTranscribe: Bool {
         get {
-            if defaults.object(forKey: Keys.autoTranscribe) == nil { return true }
-            return defaults.bool(forKey: Keys.autoTranscribe)
+            if defaults.object(forKey: "autoTranscribe") == nil { return true }
+            return defaults.bool(forKey: "autoTranscribe")
         }
-        set { defaults.set(newValue, forKey: Keys.autoTranscribe) }
+        set { defaults.set(newValue, forKey: "autoTranscribe") }
     }
 
-    /// Ensure output directory exists
+    /// Whisper language code: "ru", "en", "auto", etc. Default "ru".
+    var whisperLanguage: String {
+        get { defaults.string(forKey: "whisperLanguage") ?? "ru" }
+        set { defaults.set(newValue, forKey: "whisperLanguage") }
+    }
+
+    // MARK: - Screen Memory
+
+    var screenMemoryEnabled: Bool {
+        get {
+            if defaults.object(forKey: "screenMemoryEnabled") == nil { return true }
+            return defaults.bool(forKey: "screenMemoryEnabled")
+        }
+        set { defaults.set(newValue, forKey: "screenMemoryEnabled") }
+    }
+
+    var saveClipboard: Bool {
+        get {
+            if defaults.object(forKey: "saveClipboard") == nil { return true }
+            return defaults.bool(forKey: "saveClipboard")
+        }
+        set { defaults.set(newValue, forKey: "saveClipboard") }
+    }
+
+    var captureInterval: TimeInterval {
+        get {
+            let val = defaults.double(forKey: "captureInterval")
+            return val > 0 ? val : 3
+        }
+        set { defaults.set(newValue, forKey: "captureInterval") }
+    }
+
+    var excludedBundleIds: [String] {
+        get { defaults.stringArray(forKey: "excludedBundleIds") ?? [] }
+        set { defaults.set(newValue, forKey: "excludedBundleIds") }
+    }
+
+    // MARK: - Helpers
+
     func ensureOutputDirectory() {
         let fm = FileManager.default
         if !fm.fileExists(atPath: outputPath) {

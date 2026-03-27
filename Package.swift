@@ -2,17 +2,20 @@
 import PackageDescription
 
 let package = Package(
-    name: "AutoRec",
-    platforms: [.macOS(.v13)],
+    name: "MemorAI",
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "AutoRec",
+            name: "MemorAI",
             path: "AutoRec",
             linkerSettings: [
                 .linkedFramework("Cocoa"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("CoreAudio"),
+                .linkedFramework("Vision"),
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("UniformTypeIdentifiers"),
             ]
         ),
     ]

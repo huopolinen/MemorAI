@@ -1,125 +1,117 @@
+import AVFoundation
 import Cocoa
-import CoreGraphics
-import ScreenCaptureKit
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var recordingManager: RecordingManager!
     private var callDetector: CallDetector!
+    private var screenMemory: ScreenMemoryManager!
     private let settings = SettingsManager.shared
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Hide dock icon — menu bar only
         NSApp.setActivationPolicy(.accessory)
+
+        requestPermissions()
+        settings.ensureOutputDirectory()
+
+        // --- Screen Memory (init before menu so clipboard history is available) ---
+        screenMemory = ScreenMemoryManager()
+        screenMemory.start()
 
         setupStatusItem()
 
+        // --- Call Recording ---
         recordingManager = RecordingManager()
         recordingManager.onStateChange = { [weak self] state in
-            DispatchQueue.main.async {
-                self?.updateStatusIcon(state)
-            }
+            DispatchQueue.main.async { self?.updateStatusIcon(state) }
         }
-        // Switch call detector between normal and recording mode
         recordingManager.onRecordingActiveChanged = { [weak self] active in
             guard let self = self else { return }
             if active {
-                if self.settings.autoDetect {
-                    self.callDetector.enterRecordingMode()
-                }
+                if self.settings.autoDetect { self.callDetector.enterRecordingMode() }
             } else {
-                if self.settings.autoDetect {
-                    self.callDetector.exitRecordingMode()
-                }
+                if self.settings.autoDetect { self.callDetector.exitRecordingMode() }
             }
         }
-        // Forward silence state from system audio to call detector
         recordingManager.onSilenceChanged = { [weak self] silent in
             self?.callDetector.reportSystemAudioSilence(silent)
         }
 
         callDetector = CallDetector()
-        callDetector.onCallStarted = { [weak self] in
-            self?.recordingManager.startRecording()
-        }
-        callDetector.onCallEnded = { [weak self] in
-            self?.recordingManager.stopRecording()
-        }
+        callDetector.onCallStarted = { [weak self] in self?.recordingManager.startRecording(source: "auto-detect") }
+        callDetector.onCallEnded = { [weak self] in self?.recordingManager.stopRecording(source: "auto-detect") }
         if settings.autoDetect {
             callDetector.startMonitoring()
         }
 
-        // Request screen capture permission early via CoreGraphics
-        // This uses the stable TCC flow instead of ScreenCaptureKit's picker
-        if CGPreflightScreenCaptureAccess() {
-            print("[AppDelegate] Screen capture permission already granted")
-        } else {
-            print("[AppDelegate] Requesting screen capture permission...")
-            CGRequestScreenCaptureAccess()
-        }
     }
+
+    // MARK: - Permissions
+
+    private func requestPermissions() {
+        // Microphone
+        AVCaptureDevice.requestAccess(for: .audio) { _ in }
+
+        // Accessibility (for window titles, keyboard monitoring)
+        let options = [kAXTrustedCheckOptionPrompt.takeRetainedValue(): true] as CFDictionary
+        AXIsProcessTrustedWithOptions(options)
+    }
+
+    // MARK: - Status Bar
 
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-
         if let button = statusItem.button {
-            let size = NSSize(width: 14, height: 14)
-            let image = NSImage(size: size, flipped: false) { rect in
-                NSColor.systemGray.setFill()
-                NSBezierPath(ovalIn: rect).fill()
-                return true
-            }
-            image.isTemplate = false
-            button.image = image
+            button.image = makeCircleIcon(.systemGray)
         }
+        updateMenu()
+    }
 
+    private func makeCircleIcon(_ color: NSColor) -> NSImage {
+        let size = NSSize(width: 14, height: 14)
+        let image = NSImage(size: size, flipped: false) { rect in
+            color.setFill()
+            NSBezierPath(ovalIn: rect).fill()
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+
+    // MARK: - Menu
+
+    func menuWillOpen(_ menu: NSMenu) {
         updateMenu()
     }
 
     private func updateMenu() {
         let menu = NSMenu()
+        menu.delegate = self
 
+        // --- Call Recording Section ---
         let state = recordingManager?.state ?? .idle
         let stateItem = NSMenuItem(title: stateLabel(state), action: nil, keyEquivalent: "")
         stateItem.isEnabled = false
         menu.addItem(stateItem)
 
-        menu.addItem(NSMenuItem.separator())
+        menu.addItem(.separator())
 
         switch state {
         case .recording:
-            let pauseItem = NSMenuItem(title: "Pause", action: #selector(pauseRecording), keyEquivalent: "")
-            pauseItem.target = self
-            menu.addItem(pauseItem)
-
-            let stopItem = NSMenuItem(title: "Stop Recording", action: #selector(stopRecording), keyEquivalent: "")
-            stopItem.target = self
-            menu.addItem(stopItem)
-
+            addMenuItem(menu, "Pause", #selector(pauseRecording))
+            addMenuItem(menu, "Stop Recording", #selector(stopRecording))
         case .paused:
-            let resumeItem = NSMenuItem(title: "Resume", action: #selector(resumeRecording), keyEquivalent: "")
-            resumeItem.target = self
-            menu.addItem(resumeItem)
-
-            let stopItem = NSMenuItem(title: "Stop Recording", action: #selector(stopRecording), keyEquivalent: "")
-            stopItem.target = self
-            menu.addItem(stopItem)
-
+            addMenuItem(menu, "Resume", #selector(resumeRecording))
+            addMenuItem(menu, "Stop Recording", #selector(stopRecording))
         default:
-            let startItem = NSMenuItem(title: "Start Recording", action: #selector(startRecording), keyEquivalent: "")
-            startItem.target = self
-            menu.addItem(startItem)
+            addMenuItem(menu, "Start Recording", #selector(startRecording))
         }
 
-        let autoItem = NSMenuItem(title: "Auto-detect Calls", action: #selector(toggleAutoDetect), keyEquivalent: "")
-        autoItem.target = self
+        let autoItem = addMenuItem(menu, "Auto-detect Calls", #selector(toggleAutoDetect))
         autoItem.state = settings.autoDetect ? .on : .off
-        menu.addItem(autoItem)
 
-        let videoItem = NSMenuItem(title: "Record Screen", action: #selector(toggleRecordScreen), keyEquivalent: "")
-        videoItem.target = self
+        let videoItem = addMenuItem(menu, "Record Screen (Calls)", #selector(toggleRecordScreen))
         videoItem.state = settings.recordScreen ? .on : .off
-        menu.addItem(videoItem)
 
         let transcribeItem = NSMenuItem(title: "Auto-transcribe (Whisper)", action: #selector(toggleAutoTranscribe), keyEquivalent: "")
         transcribeItem.target = self
@@ -132,17 +124,96 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(transcribeItem)
 
-        menu.addItem(NSMenuItem.separator())
+        // --- Screen Memory Section ---
+        menu.addItem(.separator())
 
-        let folderItem = NSMenuItem(title: "Output: \(settings.outputPath)", action: #selector(chooseFolder), keyEquivalent: "")
+        let screenItem = addMenuItem(menu, "Screen Memory", #selector(toggleScreenMemory))
+        screenItem.state = settings.screenMemoryEnabled ? .on : .off
+
+        let clipItem = addMenuItem(menu, "Save Clipboard", #selector(toggleClipboard))
+        clipItem.state = settings.saveClipboard ? .on : .off
+
+        // --- Clipboard History Submenu ---
+        let clipHistoryItem = NSMenuItem(title: "Clipboard History", action: nil, keyEquivalent: "")
+        let clipSubmenu = NSMenu()
+        let entries = screenMemory?.clipboard.recentEntries ?? []
+        if entries.isEmpty {
+            let emptyItem = NSMenuItem(title: "Empty", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            clipSubmenu.addItem(emptyItem)
+        } else {
+            let outputURL = URL(fileURLWithPath: settings.outputPath)
+            let mainFont = NSFont.menuFont(ofSize: 13)
+            let dimAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.menuFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]
+
+            for (i, entry) in entries.prefix(100).enumerated() {
+                let timeStr = formatTime(entry.timestamp)
+                let item = NSMenuItem(title: "", action: #selector(clipboardItemClicked(_:)), keyEquivalent: "")
+
+                if entry.type == "image" {
+                    let imagePath = outputURL.appendingPathComponent("screen")
+                        .appendingPathComponent(dayString(entry.timestamp))
+                        .appendingPathComponent(entry.content)
+                    let label = entry.content.hasPrefix("clipboard-") ? "Screenshot" : "Image"
+
+                    let str = NSMutableAttributedString()
+                    str.append(NSAttributedString(string: "📷 \(label)  ", attributes: [.font: mainFont]))
+                    str.append(NSAttributedString(string: timeStr, attributes: dimAttrs))
+                    item.attributedTitle = str
+
+                    if let nsImage = NSImage(contentsOf: imagePath) {
+                        item.image = resizeImage(nsImage, to: NSSize(width: 32, height: 20))
+                    }
+                } else {
+                    let preview = String(entry.content
+                        .replacingOccurrences(of: "\n", with: " ")
+                        .prefix(50))
+
+                    let str = NSMutableAttributedString()
+                    str.append(NSAttributedString(string: "\(preview)  ", attributes: [.font: mainFont]))
+                    str.append(NSAttributedString(string: timeStr, attributes: dimAttrs))
+                    item.attributedTitle = str
+                    item.toolTip = String(entry.content.prefix(500))
+                }
+
+                item.target = self
+                item.tag = i
+                clipSubmenu.addItem(item)
+            }
+        }
+        clipHistoryItem.submenu = clipSubmenu
+        menu.addItem(clipHistoryItem)
+
+        // --- Excluded Apps ---
+        let excludedItem = NSMenuItem(title: "Excluded Apps…", action: nil, keyEquivalent: "")
+        let excludedSubmenu = NSMenu()
+        for bundleId in settings.excludedBundleIds {
+            let name = appName(for: bundleId)
+            let item = NSMenuItem(title: name, action: #selector(removeExcludedApp(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = bundleId
+            excludedSubmenu.addItem(item)
+        }
+        excludedSubmenu.addItem(.separator())
+        let addExcluded = NSMenuItem(title: "Add App…", action: #selector(addExcludedApp(_:)), keyEquivalent: "")
+        addExcluded.target = self
+        excludedSubmenu.addItem(addExcluded)
+        excludedItem.submenu = excludedSubmenu
+        menu.addItem(excludedItem)
+
+        // --- General ---
+        menu.addItem(.separator())
+
+        let folderItem = NSMenuItem(title: "Output: \(shortenPath(settings.outputPath))", action: #selector(chooseFolder), keyEquivalent: "")
         folderItem.target = self
         menu.addItem(folderItem)
 
-        let openItem = NSMenuItem(title: "Open Recordings Folder", action: #selector(openFolder), keyEquivalent: "")
-        openItem.target = self
-        menu.addItem(openItem)
+        addMenuItem(menu, "Open Folder", #selector(openFolder))
 
-        menu.addItem(NSMenuItem.separator())
+        menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
@@ -150,6 +221,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem.menu = menu
     }
+
+    @discardableResult
+    private func addMenuItem(_ menu: NSMenu, _ title: String, _ action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        return item
+    }
+
+    // MARK: - State Display
 
     private func stateLabel(_ state: RecordingState) -> String {
         if recordingManager?.isTranscribing == true && state == .idle {
@@ -168,50 +249,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             let color: NSColor
             switch state {
-            case .recording:
-                color = NSColor(red: 1.0, green: 0.1, blue: 0.1, alpha: 1.0)
-            case .paused:
-                color = .systemOrange
-            case .starting, .stopping:
-                color = .systemYellow
-            case .idle:
-                color = .systemGray
+            case .recording: color = NSColor(red: 1.0, green: 0.1, blue: 0.1, alpha: 1.0)
+            case .paused: color = .systemOrange
+            case .starting, .stopping: color = .systemYellow
+            case .idle: color = .systemGray
             }
-            let size = NSSize(width: 14, height: 14)
-            let image = NSImage(size: size, flipped: false) { rect in
-                color.setFill()
-                NSBezierPath(ovalIn: rect).fill()
-                return true
-            }
-            image.isTemplate = false
-            button.image = image
+            button.image = makeCircleIcon(color)
         }
         updateMenu()
     }
 
-    @objc private func startRecording() {
-        recordingManager.startRecording()
-    }
+    // MARK: - Call Recording Actions
 
-    @objc private func pauseRecording() {
-        recordingManager.pauseRecording()
-    }
-
-    @objc private func resumeRecording() {
-        recordingManager.resumeRecording()
-    }
-
-    @objc private func stopRecording() {
-        recordingManager.stopRecording()
-    }
+    @objc private func startRecording() { recordingManager.startRecording() }
+    @objc private func pauseRecording() { recordingManager.pauseRecording() }
+    @objc private func resumeRecording() { recordingManager.resumeRecording() }
+    @objc private func stopRecording() { recordingManager.stopRecording() }
 
     @objc private func toggleAutoDetect() {
         settings.autoDetect.toggle()
-        if settings.autoDetect {
-            callDetector.startMonitoring()
-        } else {
-            callDetector.stopMonitoring()
-        }
+        if settings.autoDetect { callDetector.startMonitoring() }
+        else { callDetector.stopMonitoring() }
         updateMenu()
     }
 
@@ -225,6 +283,83 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenu()
     }
 
+    // MARK: - Screen Memory Actions
+
+    @objc private func toggleScreenMemory() {
+        settings.screenMemoryEnabled.toggle()
+        updateMenu()
+    }
+
+    @objc private func toggleClipboard() {
+        settings.saveClipboard.toggle()
+        updateMenu()
+    }
+
+    @objc private func clipboardItemClicked(_ sender: NSMenuItem) {
+        let entries = screenMemory.clipboard.recentEntries
+        guard sender.tag < entries.count else { return }
+        let entry = entries[sender.tag]
+        let pb = NSPasteboard.general
+        pb.clearContents()
+
+        if entry.type == "image" {
+            let outputURL = URL(fileURLWithPath: settings.outputPath)
+            let imagePath = outputURL.appendingPathComponent("screen")
+                .appendingPathComponent(dayString(entry.timestamp))
+                .appendingPathComponent(entry.content)
+            if let image = NSImage(contentsOf: imagePath) {
+                pb.writeObjects([image])
+            }
+        } else {
+            pb.setString(entry.content, forType: .string)
+        }
+    }
+
+    // MARK: - Excluded Apps
+
+    @objc private func addExcludedApp(_ sender: NSMenuItem) {
+        let menu = NSMenu()
+        let apps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
+            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+
+        for app in apps {
+            guard let bundleId = app.bundleIdentifier else { continue }
+            if settings.excludedBundleIds.contains(bundleId) { continue }
+            let title = "\(app.localizedName ?? bundleId)"
+            let item = NSMenuItem(title: title, action: #selector(appSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = bundleId
+            if let icon = app.icon {
+                icon.size = NSSize(width: 16, height: 16)
+                item.image = icon
+            }
+            menu.addItem(item)
+        }
+
+        if let event = NSApp.currentEvent, let view = sender.menu?.highlightedItem?.view ?? statusItem.button {
+            menu.popUp(positioning: nil, at: .zero, in: view)
+        }
+    }
+
+    @objc private func appSelected(_ sender: NSMenuItem) {
+        guard let bundleId = sender.representedObject as? String else { return }
+        var excluded = settings.excludedBundleIds
+        excluded.append(bundleId)
+        settings.excludedBundleIds = excluded
+        updateMenu()
+    }
+
+    @objc private func removeExcludedApp(_ sender: NSMenuItem) {
+        guard let bundleId = sender.representedObject as? String else { return }
+        var excluded = settings.excludedBundleIds
+        excluded.removeAll { $0 == bundleId }
+        settings.excludedBundleIds = excluded
+        updateMenu()
+    }
+
+    // MARK: - General Actions
+
     @objc private func chooseFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -232,7 +367,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.canCreateDirectories = true
         panel.prompt = "Select"
         panel.message = "Choose folder for recordings"
-
         if panel.runModal() == .OK, let url = panel.url {
             settings.outputPath = url.path
             updateMenu()
@@ -240,12 +374,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openFolder() {
-        let url = URL(fileURLWithPath: settings.outputPath)
-        NSWorkspace.shared.open(url)
+        NSWorkspace.shared.open(URL(fileURLWithPath: settings.outputPath))
     }
 
     @objc private func quit() {
+        screenMemory.stop()
         recordingManager.stopRecording()
         NSApp.terminate(nil)
+    }
+
+    // MARK: - Helpers
+
+    private func formatTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        if Calendar.current.isDateInToday(date) {
+            f.dateFormat = "HH:mm"
+        } else {
+            f.dateFormat = "dd.MM HH:mm"
+        }
+        return f.string(from: date)
+    }
+
+    private func shortenPath(_ path: String) -> String {
+        path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+    }
+
+    private func appName(for bundleId: String) -> String {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId),
+           let bundle = Bundle(url: url),
+           let name = bundle.infoDictionary?["CFBundleName"] as? String {
+            return "\(name) ✕"
+        }
+        return "\(bundleId) ✕"
+    }
+
+    private func dayString(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
+    }
+
+    private func resizeImage(_ image: NSImage, to size: NSSize) -> NSImage {
+        let ratio = min(size.width / image.size.width, size.height / image.size.height)
+        let newSize = NSSize(width: image.size.width * ratio, height: image.size.height * ratio)
+        let resized = NSImage(size: newSize)
+        resized.lockFocus()
+        image.draw(in: NSRect(origin: .zero, size: newSize),
+                   from: NSRect(origin: .zero, size: image.size),
+                   operation: .copy, fraction: 1.0)
+        resized.unlockFocus()
+        return resized
     }
 }

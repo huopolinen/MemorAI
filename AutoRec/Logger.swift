@@ -1,13 +1,12 @@
 import Foundation
 import os
 
-private let logger = os.Logger(subsystem: "com.local.autorec", category: "main")
+private let logger = os.Logger(subsystem: "com.local.memorai", category: "main")
 
-/// Log to both os_log and a file for debugging
 func log(_ message: String) {
     logger.info("\(message, privacy: .public)")
-    // Also append to a log file
-    let logPath = NSString("~/Downloads/AutoRec/autorec.log").expandingTildeInPath
+    let logDir = SettingsManager.shared.outputPath
+    let logPath = "\(logDir)/memorai.log"
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
     if let data = line.data(using: .utf8) {
         if FileManager.default.fileExists(atPath: logPath) {

@@ -1,0 +1,303 @@
+#!/bin/bash
+# MemorAI CLI — manage and inspect MemorAI data
+# Usage: memorai <command> [args]
+
+BUNDLE_ID="com.local.memorai"
+if [ -d "/Applications/MemorAI.app" ]; then
+    APP_PATH="/Applications/MemorAI.app"
+else
+    APP_PATH="$(dirname "$0")/MemorAI.app"
+fi
+
+get_output_path() {
+    local path
+    path=$(defaults read "$BUNDLE_ID" outputPath 2>/dev/null)
+    if [ -z "$path" ]; then
+        path="$HOME/Downloads/MemorAI"
+    fi
+    echo "$path"
+}
+
+cmd_status() {
+    local output
+    output=$(get_output_path)
+    echo "=== MemorAI Status ==="
+
+    # Check if running
+    if pgrep -f "MemorAI" > /dev/null 2>&1; then
+        echo "App:              RUNNING"
+    else
+        echo "App:              NOT RUNNING"
+    fi
+
+    echo "Output:           $output"
+    echo ""
+
+    # Settings
+    echo "--- Settings ---"
+    local screen_mem=$(defaults read "$BUNDLE_ID" screenMemoryEnabled 2>/dev/null || echo "1")
+    local clipboard=$(defaults read "$BUNDLE_ID" saveClipboard 2>/dev/null || echo "1")
+    local interval=$(defaults read "$BUNDLE_ID" captureInterval 2>/dev/null || echo "3")
+    local auto_detect=$(defaults read "$BUNDLE_ID" autoDetect 2>/dev/null || echo "1")
+    local record_screen=$(defaults read "$BUNDLE_ID" recordScreen 2>/dev/null || echo "1")
+    local auto_transcribe=$(defaults read "$BUNDLE_ID" autoTranscribe 2>/dev/null || echo "1")
+
+    echo "Screen Memory:    $([ "$screen_mem" = "1" ] && echo ON || echo OFF)"
+    echo "Save Clipboard:   $([ "$clipboard" = "1" ] && echo ON || echo OFF)"
+    echo "Capture Interval: ${interval}s"
+    echo "Auto-detect Calls:$([ "$auto_detect" = "1" ] && echo " ON" || echo " OFF")"
+    echo "Record Screen:    $([ "$record_screen" = "1" ] && echo ON || echo OFF)"
+    echo "Auto-transcribe:  $([ "$auto_transcribe" = "1" ] && echo ON || echo OFF)"
+    echo ""
+
+    # Excluded apps
+    local excluded
+    excluded=$(defaults read "$BUNDLE_ID" excludedBundleIds 2>/dev/null | grep '"' | sed 's/.*"\(.*\)".*/\1/')
+    if [ -n "$excluded" ]; then
+        echo "--- Excluded Apps ---"
+        echo "$excluded" | while read -r bid; do
+            echo "  $bid"
+        done
+        echo ""
+    fi
+
+    # Stats
+    echo "--- Today's Data ---"
+    local today=$(date +%Y-%m-%d)
+    local screen_dir="$output/screen/$today"
+    if [ -d "$screen_dir" ]; then
+        local count=$(ls "$screen_dir"/*.json 2>/dev/null | wc -l | tr -d ' ')
+        local size=$(du -sh "$screen_dir" 2>/dev/null | cut -f1)
+        echo "Screenshots:      $count ($size)"
+    else
+        echo "Screenshots:      0"
+    fi
+
+    local clip_file="$output/clipboard.jsonl"
+    if [ -f "$clip_file" ]; then
+        local clip_count=$(wc -l < "$clip_file" | tr -d ' ')
+        echo "Clipboard entries: $clip_count"
+    else
+        echo "Clipboard entries: 0"
+    fi
+
+    local call_count=$(ls "$output"/call_*.m4a 2>/dev/null | wc -l | tr -d ' ')
+    echo "Call recordings:  $call_count"
+}
+
+cmd_screenshots() {
+    local output=$(get_output_path)
+    local today=$(date +%Y-%m-%d)
+    local day="${1:-$today}"
+    local screen_dir="$output/screen/$day"
+
+    if [ ! -d "$screen_dir" ]; then
+        echo "No screenshots for $day"
+        return
+    fi
+
+    echo "=== Screenshots for $day ==="
+    for f in "$screen_dir"/*.json; do
+        [ -f "$f" ] || continue
+        python3 -c "
+import json, sys
+d = json.load(open('$f'))
+ts = d.get('timestamp','')[:19]
+app = d.get('app_name','')
+title = d.get('window_title','')[:50] if d.get('window_title') else ''
+ocr = d.get('ocr_text','')[:80].replace('\n',' ')
+print(f'{ts}  {app:20s}  {title}')
+" 2>/dev/null
+    done
+}
+
+cmd_clipboard() {
+    local output=$(get_output_path)
+    local clip_file="$output/clipboard.jsonl"
+    local count="${1:-20}"
+
+    if [ ! -f "$clip_file" ]; then
+        echo "No clipboard history"
+        return
+    fi
+
+    echo "=== Clipboard History (last $count) ==="
+    tail -n "$count" "$clip_file" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+        ts = d.get('timestamp','')[:19]
+        app = d.get('app_name','')
+        typ = d.get('type','')
+        content = d.get('content','')[:80].replace('\n',' ')
+        print(f'{ts}  {app:20s}  [{typ:5s}]  {content}')
+    except: pass
+"
+}
+
+cmd_ocr() {
+    local output=$(get_output_path)
+    local today=$(date +%Y-%m-%d)
+    local day="${1:-$today}"
+    local screen_dir="$output/screen/$day"
+    local count="${2:-5}"
+
+    if [ ! -d "$screen_dir" ]; then
+        echo "No data for $day"
+        return
+    fi
+
+    echo "=== OCR Text (last $count from $day) ==="
+    ls "$screen_dir"/*.json 2>/dev/null | tail -n "$count" | while read f; do
+        python3 -c "
+import json
+d = json.load(open('$f'))
+ts = d.get('timestamp','')[:19]
+app = d.get('app_name','')
+ocr = d.get('ocr_text','')[:200]
+print(f'--- {ts} [{app}] ---')
+print(ocr)
+print()
+" 2>/dev/null
+    done
+}
+
+cmd_set() {
+    local key="$1"
+    local value="$2"
+
+    case "$key" in
+        screen-memory)
+            defaults write "$BUNDLE_ID" screenMemoryEnabled -bool "$value"
+            echo "Screen Memory: $value"
+            ;;
+        clipboard)
+            defaults write "$BUNDLE_ID" saveClipboard -bool "$value"
+            echo "Save Clipboard: $value"
+            ;;
+        interval)
+            defaults write "$BUNDLE_ID" captureInterval -float "$value"
+            echo "Capture Interval: ${value}s"
+            ;;
+        auto-detect)
+            defaults write "$BUNDLE_ID" autoDetect -bool "$value"
+            echo "Auto-detect Calls: $value"
+            ;;
+        *)
+            echo "Unknown setting: $key"
+            echo "Available: screen-memory, clipboard, interval, auto-detect"
+            return 1
+            ;;
+    esac
+    echo "(Restart app to apply)"
+}
+
+cmd_exclude() {
+    local action="$1"
+    local bundle_id="$2"
+
+    case "$action" in
+        add)
+            if [ -z "$bundle_id" ]; then
+                echo "Usage: memorai exclude add <bundle-id>"
+                return 1
+            fi
+            local current
+            current=$(defaults read "$BUNDLE_ID" excludedBundleIds 2>/dev/null || echo "()")
+            defaults write "$BUNDLE_ID" excludedBundleIds -array-add "$bundle_id"
+            echo "Added $bundle_id to exclusions"
+            ;;
+        remove)
+            if [ -z "$bundle_id" ]; then
+                echo "Usage: memorai exclude remove <bundle-id>"
+                return 1
+            fi
+            # Read current, filter out the one to remove, write back
+            local items
+            items=$(defaults read "$BUNDLE_ID" excludedBundleIds 2>/dev/null | grep '"' | sed 's/.*"\(.*\)".*/\1/' | grep -v "^${bundle_id}$")
+            if [ -z "$items" ]; then
+                defaults write "$BUNDLE_ID" excludedBundleIds -array
+            else
+                local args=""
+                while IFS= read -r item; do
+                    args="$args $item"
+                done <<< "$items"
+                defaults write "$BUNDLE_ID" excludedBundleIds -array $args
+            fi
+            echo "Removed $bundle_id from exclusions"
+            ;;
+        list)
+            defaults read "$BUNDLE_ID" excludedBundleIds 2>/dev/null | grep '"' | sed 's/.*"\(.*\)".*/  \1/'
+            ;;
+        *)
+            echo "Usage: memorai exclude <add|remove|list> [bundle-id]"
+            ;;
+    esac
+}
+
+cmd_start() {
+    if pgrep -f "MemorAI" > /dev/null 2>&1; then
+        echo "MemorAI is already running"
+    else
+        open "$APP_PATH"
+        echo "MemorAI started"
+    fi
+}
+
+cmd_stop() {
+    pkill -f "MemorAI" 2>/dev/null && echo "MemorAI stopped" || echo "MemorAI is not running"
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_help() {
+    cat << 'EOF'
+MemorAI — remembers everything you do on your computer
+
+Usage: memorai <command> [args]
+
+Commands:
+  status                    Show app status, settings, and today's stats
+  start                     Start MemorAI
+  stop                      Stop MemorAI
+  restart                   Restart MemorAI
+
+  screenshots [date]        List today's screenshots (or given YYYY-MM-DD)
+  clipboard [count]         Show clipboard history (default: last 20)
+  ocr [date] [count]        Show OCR text from screenshots
+
+  set <key> <value>         Change a setting
+    screen-memory true/false
+    clipboard true/false
+    interval <seconds>
+    auto-detect true/false
+
+  exclude add <bundle-id>   Add app to exclusion list
+  exclude remove <bundle-id>  Remove app from exclusion list
+  exclude list              List excluded apps
+
+  help                      Show this help
+EOF
+}
+
+# Main dispatcher
+case "${1:-help}" in
+    status)       cmd_status ;;
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    restart)      cmd_restart ;;
+    screenshots)  cmd_screenshots "$2" ;;
+    clipboard)    cmd_clipboard "$2" ;;
+    ocr)          cmd_ocr "$2" "$3" ;;
+    set)          cmd_set "$2" "$3" ;;
+    exclude)      cmd_exclude "$2" "$3" ;;
+    help|--help|-h) cmd_help ;;
+    *)            echo "Unknown command: $1"; cmd_help ;;
+esac

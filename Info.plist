@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>AutoRec</string>
+    <string>MemorAI</string>
     <key>CFBundleIdentifier</key>
-    <string>com.local.autorec</string>
+    <string>com.local.memorai</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
@@ -13,14 +13,16 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
-    <string>AutoRec</string>
+    <string>MemorAI</string>
     <key>CFBundleIconFile</key>
-    <string>AutoRec</string>
+    <string>MemorAI</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>AutoRec needs microphone access to record your voice during calls.</string>
+    <string>MemorAI needs microphone access to record your voice during calls.</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>AutoRec needs screen capture access to record system audio and screen during calls.</string>
+    <string>MemorAI needs screen capture access to record screen and system audio.</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>MemorAI needs accessibility access to read window titles and browser URLs.</string>
 </dict>
 </plist>

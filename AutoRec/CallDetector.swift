@@ -1,6 +1,5 @@
 import Foundation
 import CoreAudio
-import AVFoundation
 
 /// Detects active calls by monitoring microphone usage.
 /// When the mic is grabbed by another process (Zoom, Teams, FaceTime, etc.)
@@ -30,8 +29,10 @@ class CallDetector {
     /// System audio has been silent long enough — set by RecordingManager
     private(set) var systemAudioSilent = false
 
-    /// Minimum recording duration before auto-stop is considered (seconds)
-    private let minRecordingDuration: TimeInterval = 30.0
+    /// Minimum recording duration before auto-stop is considered (seconds).
+    /// Must be longer than SCStream warmup (~30s) + silence threshold (20s)
+    /// to avoid false call-end detection from startup silence.
+    private let minRecordingDuration: TimeInterval = 60.0
 
     func startMonitoring() {
         stopMonitoring()

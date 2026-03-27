@@ -20,11 +20,12 @@ class RecordingManager {
 
     private(set) var isTranscribing = false
 
-    func startRecording() {
+    func startRecording(source: String = "manual") {
         guard state == .idle else {
             log("[RecordingManager] Cannot start — state is \(state)")
             return
         }
+        log("[RecordingManager] Recording started (source: \(source))")
         setState(.starting)
         onRecordingActiveChanged?(true)
 
@@ -86,8 +87,9 @@ class RecordingManager {
         print("[RecordingManager] Resumed")
     }
 
-    func stopRecording() {
+    func stopRecording(source: String = "manual") {
         guard state == .recording || state == .starting || state == .paused else { return }
+        log("[RecordingManager] Recording stopped (source: \(source))")
         setState(.stopping)
 
         let micURL = currentMicURL
