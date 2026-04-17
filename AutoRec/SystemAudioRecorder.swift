@@ -249,16 +249,6 @@ extension SystemAudioRecorder: SCStreamOutput {
         case .audio:
             guard let input = audioInput, input.isReadyForMoreMediaData else { return }
 
-            // Skip initial silent buffers from SCStream startup (~30s of digital silence)
-            if !audioWarmedUp {
-                let rms = bufferRMS(sampleBuffer)
-                if rms < warmupRMSThreshold {
-                    return // still warming up, discard silent buffer
-                }
-                audioWarmedUp = true
-                log("[SystemAudioRecorder] Audio warmed up (first non-silent buffer)")
-            }
-
             if !audioSessionStarted {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
                 audioWriter?.startSession(atSourceTime: pts)
@@ -269,6 +259,18 @@ extension SystemAudioRecorder: SCStreamOutput {
                 }
             }
             input.append(sampleBuffer)
+
+            // Warmup suppresses silence detection for the first non-silent buffer, so the
+            // ~30s of digital silence SCStream emits at startup doesn't trigger auto-stop.
+            // We always write the buffer so the audio track never finalizes empty.
+            if !audioWarmedUp {
+                let rms = bufferRMS(sampleBuffer)
+                if rms >= warmupRMSThreshold {
+                    audioWarmedUp = true
+                    log("[SystemAudioRecorder] Audio warmed up (first non-silent buffer)")
+                }
+                return
+            }
             updateSilenceState(sampleBuffer)
 
         case .microphone:

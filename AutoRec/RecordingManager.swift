@@ -76,7 +76,7 @@ class RecordingManager {
         systemAudioRecorder?.isPaused = true
         micRecorder?.isPaused = true
         setState(.paused)
-        print("[RecordingManager] Paused")
+        log("[RecordingManager] Paused")
     }
 
     func resumeRecording() {
@@ -84,7 +84,7 @@ class RecordingManager {
         systemAudioRecorder?.isPaused = false
         micRecorder?.isPaused = false
         setState(.recording)
-        print("[RecordingManager] Resumed")
+        log("[RecordingManager] Resumed")
     }
 
     func stopRecording(source: String = "manual") {
@@ -102,18 +102,22 @@ class RecordingManager {
             systemAudioRecorder = nil
             setState(.idle)
             onRecordingActiveChanged?(false)
-            print("[RecordingManager] All recorders stopped")
+            log("[RecordingManager] All recorders stopped")
 
             // Auto-transcribe if enabled and whisper is available
-            if settings.autoTranscribe && Transcriber.shared.isAvailable {
+            if settings.autoTranscribe {
+                guard Transcriber.shared.isAvailable else {
+                    log("[RecordingManager] Auto-transcribe on but whisper/model missing — skipping")
+                    return
+                }
                 isTranscribing = true
                 onStateChange?(state) // trigger UI update
-                print("[RecordingManager] Starting transcription...")
+                log("[RecordingManager] Starting transcription…")
                 Transcriber.shared.transcribeSession(micURL: micURL, systemURL: sysURL) { [weak self] in
                     self?.isTranscribing = false
                     self?.onTranscriptionDone?()
                     self?.onStateChange?(self?.state ?? .idle)
-                    print("[RecordingManager] Transcription complete")
+                    log("[RecordingManager] Transcription complete")
                 }
             }
         }

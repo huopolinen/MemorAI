@@ -13,77 +13,27 @@ class Transcriber {
         }
         return "ffmpeg"
     }()
-    private let modelPath = NSString("~/.local/share/whisper-models/ggml-base.bin").expandingTildeInPath
+
+    /// Prefer medium model (better Russian accuracy). Fall back to base if medium is missing.
+    private let modelPath: String = {
+        let fm = FileManager.default
+        let medium = NSString("~/.local/share/whisper-models/ggml-medium.bin").expandingTildeInPath
+        let base = NSString("~/.local/share/whisper-models/ggml-base.bin").expandingTildeInPath
+        if fm.fileExists(atPath: medium) { return medium }
+        return base
+    }()
+
+    /// Minimum audio duration (seconds) for a track to be considered usable.
+    /// A mic file that only captured the first few seconds (silent failure) must not
+    /// be merged with a full system track — that produces garbage output.
+    private let minTrackDuration: Double = 30.0
+
+    /// Hard cap for a single whisper/ffmpeg invocation (seconds). Prevents runaway jobs.
+    private let processTimeout: TimeInterval = 3600
 
     var isAvailable: Bool {
         FileManager.default.fileExists(atPath: whisperPath) &&
         FileManager.default.fileExists(atPath: modelPath)
-    }
-
-    /// Transcribe an audio file. Returns the path to the transcript .txt file, or nil on failure.
-    func transcribe(audioURL: URL, completion: @escaping (URL?) -> Void) {
-        DispatchQueue.global(qos: .utility).async { [self] in
-            guard isAvailable else {
-                print("[Transcriber] whisper-cli or model not found")
-                completion(nil)
-                return
-            }
-
-            let baseName = audioURL.deletingPathExtension().lastPathComponent
-            let dir = audioURL.deletingLastPathComponent()
-            let wavURL = dir.appendingPathComponent(baseName + ".wav")
-            let transcriptBase = dir.appendingPathComponent(
-                baseName.replacingOccurrences(of: "_mic", with: "_transcript")
-                        .replacingOccurrences(of: "_system", with: "_transcript")
-            )
-
-            // Skip if transcript already exists
-            let txtPath = transcriptBase.appendingPathExtension("txt")
-            if FileManager.default.fileExists(atPath: txtPath.path) {
-                print("[Transcriber] Transcript already exists: \(txtPath.lastPathComponent)")
-                completion(txtPath)
-                return
-            }
-
-            // Step 1: Convert m4a → wav (16kHz mono, required by whisper)
-            print("[Transcriber] Converting to WAV: \(audioURL.lastPathComponent)")
-            let convertResult = runProcess(
-                ffmpegPath,
-                args: ["-y", "-i", audioURL.path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavURL.path]
-            )
-            guard convertResult.exitCode == 0 else {
-                print("[Transcriber] ffmpeg failed: \(convertResult.stderr)")
-                completion(nil)
-                return
-            }
-
-            // Step 2: Run whisper-cli
-            print("[Transcriber] Transcribing: \(wavURL.lastPathComponent)")
-            let lang = SettingsManager.shared.whisperLanguage
-            let whisperResult = runProcess(
-                whisperPath,
-                args: [
-                    "-m", modelPath,
-                    "-l", lang,
-                    "-et", "2.2",
-                    "-lpt", "-0.5",
-                    "-otxt",
-                    "-of", transcriptBase.path,
-                    wavURL.path
-                ]
-            )
-
-            // Clean up temp wav
-            try? FileManager.default.removeItem(at: wavURL)
-
-            if whisperResult.exitCode == 0 && FileManager.default.fileExists(atPath: txtPath.path) {
-                print("[Transcriber] ✅ Transcript saved: \(txtPath.lastPathComponent)")
-                completion(txtPath)
-            } else {
-                print("[Transcriber] ❌ Whisper failed: \(whisperResult.stderr)")
-                completion(nil)
-            }
-        }
     }
 
     /// Transcribe a recording session by merging mic + system audio into one file.
@@ -91,15 +41,20 @@ class Transcriber {
     func transcribeSession(micURL: URL?, systemURL: URL?, completion: @escaping () -> Void) {
         DispatchQueue.global(qos: .utility).async { [self] in
             guard isAvailable else {
-                print("[Transcriber] whisper-cli or model not found")
+                log("[Transcriber] whisper-cli or model not found (model: \(modelPath))")
                 DispatchQueue.main.async { completion() }
                 return
             }
 
-            let micOK = hasContent(micURL)
-            let sysOK = hasContent(systemURL)
+            let micDur = trackDuration(micURL)
+            let sysDur = trackDuration(systemURL)
+            let micOK = micDur >= minTrackDuration
+            let sysOK = sysDur >= minTrackDuration
+
+            log("[Transcriber] Track durations — mic: \(Int(micDur))s (ok=\(micOK)), system: \(Int(sysDur))s (ok=\(sysOK))")
 
             guard micOK || sysOK else {
+                log("[Transcriber] Both tracks too short — skipping transcription")
                 DispatchQueue.main.async { completion() }
                 return
             }
@@ -114,7 +69,7 @@ class Transcriber {
             let txtPath = transcriptBase.appendingPathExtension("txt")
 
             if FileManager.default.fileExists(atPath: txtPath.path) {
-                print("[Transcriber] Transcript already exists: \(txtPath.lastPathComponent)")
+                log("[Transcriber] Transcript already exists: \(txtPath.lastPathComponent)")
                 DispatchQueue.main.async { completion() }
                 return
             }
@@ -124,10 +79,9 @@ class Transcriber {
                         .replacingOccurrences(of: "_system", with: "_merged") + ".wav"
             )
 
-            // Merge mic + system → mono 16kHz wav
-            // Normalize both sources to same loudness before mixing, and trim initial silence
-            // from SCStream startup delay (~30s of digital silence on system audio)
-            print("[Transcriber] Merging audio tracks...")
+            // Merge both tracks only when both are long enough. Otherwise use the usable single track
+            // to avoid diluting a good track with a broken one.
+            log("[Transcriber] Preparing audio (\(micOK && sysOK ? "merge mic+system" : (micOK ? "mic only" : "system only")))")
             let convertResult: ProcessResult
             if micOK && sysOK {
                 convertResult = runProcess(ffmpegPath, args: [
@@ -152,20 +106,19 @@ class Transcriber {
             }
 
             guard convertResult.exitCode == 0 else {
-                print("[Transcriber] ffmpeg merge failed: \(convertResult.stderr)")
+                log("[Transcriber] ❌ ffmpeg merge failed (exit \(convertResult.exitCode)): \(convertResult.stderr.suffix(500))")
                 DispatchQueue.main.async { completion() }
                 return
             }
 
             // Get duration in seconds
-            let duration = Self.wavDuration(mergedWav, ffmpegPath: ffmpegPath)
+            let duration = trackDuration(mergedWav)
             let chunkSec = 600.0 // 10 minutes per chunk
             let lang = SettingsManager.shared.whisperLanguage
             var fullTranscript = ""
 
             if duration <= chunkSec * 1.5 {
-                // Short enough — transcribe in one go
-                print("[Transcriber] Transcribing merged audio (\(Int(duration))s)...")
+                log("[Transcriber] Transcribing merged audio (\(Int(duration))s, model: \((modelPath as NSString).lastPathComponent))...")
                 let tmpBase = dir.appendingPathComponent("_whisper_tmp")
                 let result = runProcess(whisperPath, args: [
                     "-m", modelPath, "-l", lang,
@@ -176,28 +129,30 @@ class Transcriber {
                 if result.exitCode == 0,
                    let text = try? String(contentsOf: tmpBase.appendingPathExtension("txt"), encoding: .utf8) {
                     fullTranscript = text
+                } else if result.exitCode != 0 {
+                    log("[Transcriber] ❌ Whisper failed (exit \(result.exitCode)): \(result.stderr.suffix(500))")
                 }
                 try? FileManager.default.removeItem(at: tmpBase.appendingPathExtension("txt"))
             } else {
-                // Split into chunks to prevent hallucination loops
                 let chunks = Int(ceil(duration / chunkSec))
-                print("[Transcriber] Transcribing \(chunks) chunks (\(Int(duration))s total)...")
+                log("[Transcriber] Transcribing \(chunks) chunks (\(Int(duration))s total, model: \((modelPath as NSString).lastPathComponent))...")
 
                 for i in 0..<chunks {
                     let offset = Double(i) * chunkSec
                     let chunkWav = dir.appendingPathComponent("_chunk_\(i).wav")
                     let chunkBase = dir.appendingPathComponent("_chunk_\(i)")
 
-                    // Extract chunk
                     let extractResult = runProcess(ffmpegPath, args: [
                         "-y", "-i", mergedWav.path,
                         "-ss", String(Int(offset)), "-t", String(Int(chunkSec)),
                         "-c:a", "pcm_s16le", chunkWav.path
                     ])
-                    guard extractResult.exitCode == 0 else { continue }
+                    guard extractResult.exitCode == 0 else {
+                        log("[Transcriber] ⚠️ Chunk \(i+1) extraction failed, skipping")
+                        continue
+                    }
 
-                    // Transcribe chunk
-                    print("[Transcriber]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s...")
+                    log("[Transcriber]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s…")
                     let result = runProcess(whisperPath, args: [
                         "-m", modelPath, "-l", lang,
                         "-et", "2.2", "-lpt", "-0.5",
@@ -208,44 +163,35 @@ class Transcriber {
                     if result.exitCode == 0,
                        let text = try? String(contentsOf: chunkBase.appendingPathExtension("txt"), encoding: .utf8) {
                         fullTranscript += text
+                    } else {
+                        log("[Transcriber] ⚠️ Chunk \(i+1) whisper failed (exit \(result.exitCode))")
                     }
 
-                    // Clean up chunk files
                     try? FileManager.default.removeItem(at: chunkWav)
                     try? FileManager.default.removeItem(at: chunkBase.appendingPathExtension("txt"))
                 }
             }
 
-            // Clean up merged wav
             try? FileManager.default.removeItem(at: mergedWav)
 
-            // Write and deduplicate
             if !fullTranscript.isEmpty {
                 try? fullTranscript.write(to: txtPath, atomically: true, encoding: .utf8)
                 deduplicateTranscript(at: txtPath)
-                print("[Transcriber] ✅ Transcript saved: \(txtPath.lastPathComponent)")
+                log("[Transcriber] ✅ Transcript saved: \(txtPath.lastPathComponent)")
             } else {
-                print("[Transcriber] ❌ Whisper produced no output")
+                log("[Transcriber] ❌ Whisper produced no output")
             }
 
             DispatchQueue.main.async { completion() }
         }
     }
 
-    /// Get wav file duration in seconds via ffprobe/ffmpeg.
-    private static func wavDuration(_ url: URL, ffmpegPath: String) -> Double {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: ffmpegPath)
-        proc.arguments = ["-i", url.path, "-f", "null", "-"]
-        let pipe = Pipe()
-        proc.standardError = pipe
-        proc.standardOutput = Pipe()
-        try? proc.run()
-        proc.waitUntilExit()
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        // Parse "Duration: HH:MM:SS.xx"
-        if let range = output.range(of: #"Duration: (\d+):(\d+):(\d+\.\d+)"#, options: .regularExpression),
-           let match = try? NSRegularExpression(pattern: #"Duration: (\d+):(\d+):(\d+\.\d+)"#)
+    /// Get media file duration in seconds via ffmpeg. Returns 0 on failure or missing file.
+    private func trackDuration(_ url: URL?) -> Double {
+        guard let url = url, FileManager.default.fileExists(atPath: url.path) else { return 0 }
+        let result = runProcess(ffmpegPath, args: ["-i", url.path, "-f", "null", "-"], timeout: 10)
+        let output = result.stderr
+        if let match = try? NSRegularExpression(pattern: #"Duration: (\d+):(\d+):(\d+\.\d+)"#)
                 .firstMatch(in: output, range: NSRange(output.startIndex..., in: output)) {
             let h = Double((output as NSString).substring(with: match.range(at: 1))) ?? 0
             let m = Double((output as NSString).substring(with: match.range(at: 2))) ?? 0
@@ -253,12 +199,6 @@ class Transcriber {
             return h * 3600 + m * 60 + s
         }
         return 0
-    }
-
-    private func hasContent(_ url: URL?) -> Bool {
-        guard let url = url, FileManager.default.fileExists(atPath: url.path) else { return false }
-        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-        return (attrs?[.size] as? UInt64 ?? 0) > 1000
     }
 
     /// Remove hallucination loops: exact duplicates and near-duplicate runs.
@@ -296,7 +236,6 @@ class Transcriber {
                 }
                 let runLen = runEnd - i
                 if runLen >= 3 {
-                    // Hallucination run — keep only the first line
                     result.append(deduped[i])
                     i = runEnd
                     continue
@@ -311,7 +250,7 @@ class Transcriber {
 
         let removed = lines.count - result.count
         if removed > 0 {
-            print("[Transcriber] Dedup: removed \(removed) hallucinated lines")
+            log("[Transcriber] Dedup: removed \(removed) hallucinated lines")
         }
     }
 
@@ -321,7 +260,9 @@ class Transcriber {
         let stderr: String
     }
 
-    private func runProcess(_ path: String, args: [String]) -> ProcessResult {
+    /// Run a subprocess with an optional timeout. On timeout the process is terminated
+    /// and exit code -2 is returned.
+    private func runProcess(_ path: String, args: [String], timeout: TimeInterval? = nil) -> ProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = args
@@ -333,13 +274,31 @@ class Transcriber {
 
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return ProcessResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
         }
 
+        let deadline = timeout ?? processTimeout
+        var timedOut = false
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + deadline)
+        timer.setEventHandler {
+            if process.isRunning {
+                timedOut = true
+                process.terminate()
+            }
+        }
+        timer.resume()
+
+        process.waitUntilExit()
+        timer.cancel()
+
         let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return ProcessResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
+        let exitCode: Int32 = timedOut ? -2 : process.terminationStatus
+        if timedOut {
+            log("[Transcriber] ⏱ Process timed out after \(Int(deadline))s: \((path as NSString).lastPathComponent)")
+        }
+        return ProcessResult(exitCode: exitCode, stdout: stdout, stderr: stderr)
     }
 }
