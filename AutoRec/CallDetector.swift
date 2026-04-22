@@ -28,9 +28,14 @@ class CallDetector {
 
     /// System audio has been silent long enough — set by RecordingManager
     private(set) var systemAudioSilent = false
+    /// Mic has been silent long enough — set by RecordingManager
+    private(set) var micSilent = false
+    /// True while system audio is a usable end-of-call signal. Set to false when the
+    /// SystemAudioRecorder reports that no system audio ever arrived (mic-only session).
+    private(set) var systemAudioAvailable = true
 
     /// Minimum recording duration before auto-stop is considered (seconds).
-    /// Must be longer than SCStream warmup (~30s) + silence threshold (20s)
+    /// Must be longer than SCStream warmup (~30s) + silence threshold
     /// to avoid false call-end detection from startup silence.
     private let minRecordingDuration: TimeInterval = 60.0
 
@@ -54,6 +59,8 @@ class CallDetector {
     func enterRecordingMode() {
         recordingMode = true
         systemAudioSilent = false
+        micSilent = false
+        systemAudioAvailable = true
         recordingStartTime = Date()
         // Keep timer running but checkMicStatus will skip in recording mode
         log("[CallDetector] Entered recording mode")
@@ -64,6 +71,8 @@ class CallDetector {
         recordingMode = false
         recordingStartTime = nil
         systemAudioSilent = false
+        micSilent = false
+        systemAudioAvailable = true
         activeCount = 0
         inactiveCount = 0
         micInUse = false
@@ -82,20 +91,46 @@ class CallDetector {
         }
     }
 
+    /// Called by RecordingManager when mic silence state changes (speaker is quiet / muted).
+    func reportMicSilence(_ silent: Bool) {
+        let changed = micSilent != silent
+        micSilent = silent
+        if changed {
+            log("[CallDetector] Mic silence: \(silent)")
+            if silent && recordingMode {
+                tryEndCall()
+            }
+        }
+    }
+
+    /// Called by RecordingManager when we learn the session has no system audio at all
+    /// (voice memo, headphones-only call). From this point end-of-call is decided by mic alone.
+    func reportSystemAudioUnavailable() {
+        guard recordingMode, systemAudioAvailable else { return }
+        systemAudioAvailable = false
+        log("[CallDetector] System audio unavailable — call-end gated on mic silence only")
+        tryEndCall()
+    }
+
     private func tryEndCall() {
-        guard recordingMode, systemAudioSilent else { return }
+        guard recordingMode else { return }
+        // Require mic silence. If system audio is available, also require system silence
+        // (AND-gate) — a brief lull on one side of the call is not the end of the call.
+        let systemCondition = !systemAudioAvailable || systemAudioSilent
+        guard micSilent, systemCondition else { return }
+
         if let start = recordingStartTime,
            Date().timeIntervalSince(start) >= minRecordingDuration {
-            log("[CallDetector] Call ended (system audio silent, recording >\(Int(minRecordingDuration))s)")
+            let reason = systemAudioAvailable
+                ? "mic & system silent"
+                : "mic silent, system unavailable"
+            log("[CallDetector] Call ended (\(reason), recording >\(Int(minRecordingDuration))s)")
             onCallEnded?()
-        } else {
-            // Recording too short — schedule a retry at the minimum duration mark
-            if let start = recordingStartTime {
-                let remaining = minRecordingDuration - Date().timeIntervalSince(start) + 1.0
-                log("[CallDetector] Silence detected but recording too short, will retry in \(Int(remaining))s")
-                DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
-                    self?.tryEndCall()
-                }
+        } else if let start = recordingStartTime {
+            let remaining = minRecordingDuration - Date().timeIntervalSince(start) + 1.0
+            log("[CallDetector] Silence detected but recording too short, will retry in \(Int(remaining))s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+                self?.tryEndCall()
             }
         }
     }

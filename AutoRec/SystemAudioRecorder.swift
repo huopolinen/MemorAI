@@ -36,14 +36,22 @@ class SystemAudioRecorder: NSObject {
     /// Fires when system audio transitions to/from silence.
     /// `true` = silent for silenceDurationThreshold, `false` = audio resumed.
     var onSilenceChanged: ((Bool) -> Void)?
+    /// Fires once per session if system audio never produced a non-silent buffer within
+    /// warmupTimeout seconds — signals the session is mic-only (voice memo, headphone-only call).
+    var onSystemAudioUnavailable: (() -> Void)?
+    /// Fires if SCStream terminates with an error so the session can be stopped cleanly
+    /// instead of leaving the mic recording into a dead file.
+    var onStreamError: ((Error) -> Void)?
     private let silenceRMSThreshold: Float = 0.001
-    private let silenceDurationThreshold: TimeInterval = 20.0
+    private let silenceDurationThreshold: TimeInterval = 90.0
     private var silenceStart: Date?
     private var isSilent = false
 
     // --- Warmup: skip initial silent buffers from SCStream startup ---
     private var audioWarmedUp = false
     private let warmupRMSThreshold: Float = 0.0005
+    private let warmupTimeout: TimeInterval = 30.0
+    private var warmupTimer: DispatchSourceTimer?
 
     /// If videoURL is nil, only audio is captured (no screen).
     init(audioURL: URL, videoURL: URL?) {
@@ -137,7 +145,26 @@ class SystemAudioRecorder: NSObject {
         try await stream.startCapture()
         isRecording = true
 
+        startWarmupTimer()
+
         log("[SystemAudioRecorder] Started — audio: \(audioURL.lastPathComponent), video: \(videoURL?.lastPathComponent ?? "off")")
+    }
+
+    /// Arm a one-shot timer: if no non-silent audio buffer arrives in `warmupTimeout` seconds,
+    /// treat the session as having no system audio (mic-only use case).
+    private func startWarmupTimer() {
+        warmupTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + warmupTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.isRecording, !self.audioWarmedUp else { return }
+            log("[SystemAudioRecorder] No system audio after \(Int(self.warmupTimeout))s — treating session as mic-only")
+            DispatchQueue.main.async { [weak self] in
+                self?.onSystemAudioUnavailable?()
+            }
+        }
+        timer.resume()
+        warmupTimer = timer
     }
 
     /// Create video writer lazily on the first real frame, so we know the exact pixel dimensions.
@@ -190,6 +217,9 @@ class SystemAudioRecorder: NSObject {
     func stop() async {
         guard isRecording else { return }
         isRecording = false
+
+        warmupTimer?.cancel()
+        warmupTimer = nil
 
         do {
             try await stream?.stopCapture()
@@ -372,6 +402,11 @@ extension SystemAudioRecorder: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("[SystemAudioRecorder] Stream stopped with error: \(error)")
         isRecording = false
+        warmupTimer?.cancel()
+        warmupTimer = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.onStreamError?(error)
+        }
     }
 }
 

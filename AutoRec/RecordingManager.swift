@@ -7,6 +7,11 @@ class RecordingManager {
     var onRecordingActiveChanged: ((Bool) -> Void)?
     /// Fired when system audio silence state changes during recording.
     var onSilenceChanged: ((Bool) -> Void)?
+    /// Fired when mic silence state changes during recording.
+    var onMicSilenceChanged: ((Bool) -> Void)?
+    /// Fired once if the session produced no system audio within the warmup window
+    /// (mic-only voice memo or headphones-only call).
+    var onSystemAudioUnavailable: (() -> Void)?
     /// Fired when transcription completes after a recording
     var onTranscriptionDone: (() -> Void)?
 
@@ -46,14 +51,25 @@ class RecordingManager {
         Task {
             do {
                 let sysRec = SystemAudioRecorder(audioURL: sysURL, videoURL: vidURL)
-                // Wire up silence detection
+                // Wire up silence / availability / error signals
                 sysRec.onSilenceChanged = { [weak self] silent in
                     self?.onSilenceChanged?(silent)
+                }
+                sysRec.onSystemAudioUnavailable = { [weak self] in
+                    self?.onSystemAudioUnavailable?()
+                }
+                sysRec.onStreamError = { [weak self] error in
+                    guard let self = self, self.state == .recording || self.state == .starting else { return }
+                    log("[RecordingManager] SCStream error — stopping session: \(error.localizedDescription)")
+                    self.stopRecording(source: "stream-error")
                 }
                 self.systemAudioRecorder = sysRec
                 try await sysRec.start()
 
                 let micRec = MicRecorder(outputURL: micURL)
+                micRec.onSilenceChanged = { [weak self] silent in
+                    self?.onMicSilenceChanged?(silent)
+                }
                 self.micRecorder = micRec
                 try micRec.start()
 

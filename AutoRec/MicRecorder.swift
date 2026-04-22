@@ -25,6 +25,14 @@ class MicRecorder {
     private var writeErrorCount: Int = 0
     private let maxWriteErrors = 5
 
+    // --- Silence detection (mirrors SystemAudioRecorder) ---
+    /// Fires on transitions: true = mic silent for silenceDurationThreshold, false = voice resumed.
+    var onSilenceChanged: ((Bool) -> Void)?
+    private let silenceRMSThreshold: Float = 0.001
+    private let silenceDurationThreshold: TimeInterval = 90.0
+    private var silenceStart: Date?
+    private var isSilent = false
+
     init(outputURL: URL) {
         self.outputURL = outputURL
     }
@@ -78,6 +86,7 @@ class MicRecorder {
                     self.stop()
                 }
             }
+            self.updateSilenceState(buffer)
         }
 
         try engine.start()
@@ -141,7 +150,54 @@ class MicRecorder {
         engine?.stop()
         engine = nil
         audioFile = nil
+        silenceStart = nil
+        isSilent = false
         log("[MicRecorder] Recording stopped (\(bufferCount) buffers total)")
+    }
+
+    // MARK: - Silence detection
+
+    /// RMS across all channels of a Float32 PCM buffer. Returns 0 for non-float formats.
+    private func bufferRMS(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let channelData = buffer.floatChannelData else { return 0 }
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return 0 }
+        let channels = Int(buffer.format.channelCount)
+        var sum: Float = 0
+        for ch in 0..<channels {
+            let samples = channelData[ch]
+            for i in 0..<frameCount {
+                let s = samples[i]
+                sum += s * s
+            }
+        }
+        return sqrtf(sum / Float(frameCount * channels))
+    }
+
+    private func updateSilenceState(_ buffer: AVAudioPCMBuffer) {
+        let rms = bufferRMS(buffer)
+        let now = Date()
+        if rms < silenceRMSThreshold {
+            if silenceStart == nil {
+                silenceStart = now
+            }
+            if !isSilent, let start = silenceStart, now.timeIntervalSince(start) >= silenceDurationThreshold {
+                isSilent = true
+                log("[MicRecorder] Silence detected (>\(Int(silenceDurationThreshold))s)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.onSilenceChanged?(true)
+                }
+            }
+        } else {
+            silenceStart = nil
+            if isSilent {
+                isSilent = false
+                log("[MicRecorder] Voice resumed")
+                DispatchQueue.main.async { [weak self] in
+                    self?.onSilenceChanged?(false)
+                }
+            }
+        }
     }
 }
 

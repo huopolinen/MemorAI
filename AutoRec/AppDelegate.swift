@@ -36,6 +36,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingManager.onSilenceChanged = { [weak self] silent in
             self?.callDetector.reportSystemAudioSilence(silent)
         }
+        recordingManager.onMicSilenceChanged = { [weak self] silent in
+            self?.callDetector.reportMicSilence(silent)
+        }
+        recordingManager.onSystemAudioUnavailable = { [weak self] in
+            self?.callDetector.reportSystemAudioUnavailable()
+        }
 
         callDetector = CallDetector()
         callDetector.onCallStarted = { [weak self] in self?.recordingManager.startRecording(source: "auto-detect") }
