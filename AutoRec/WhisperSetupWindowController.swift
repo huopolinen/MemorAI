@@ -4,7 +4,10 @@ class WhisperSetupWindowController: NSWindowController {
     static let shared = WhisperSetupWindowController()
 
     private var whisperStatusLabel: NSTextField!
+    private var installBrewButton: NSButton!
+    private var installBrewHint: NSTextField!
     private var installWhisperButton: NSButton!
+    private var installWhisperHint: NSTextField!
     private var modelStatusLabel: NSTextField!
     private var downloadButton: NSButton!
     private var progressBar: NSProgressIndicator!
@@ -12,7 +15,7 @@ class WhisperSetupWindowController: NSWindowController {
 
     private convenience init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 490, height: 320),
+            contentRect: NSRect(x: 0, y: 0, width: 490, height: 358),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -47,34 +50,47 @@ class WhisperSetupWindowController: NSWindowController {
 
         // ── Title ────────────────────────────────────────────────────────────
         let title = label("Whisper Transcription Setup", size: 14, bold: true)
-        title.frame = NSRect(x: pad, y: 282, width: fw, height: 20)
+        title.frame = NSRect(x: pad, y: 320, width: fw, height: 20)
         content.addSubview(title)
 
         // ── whisper-cli section ──────────────────────────────────────────────
         let wHead = label("whisper-cli binary:", size: 11)
         wHead.textColor = .secondaryLabelColor
-        wHead.frame = NSRect(x: pad, y: 258, width: fw, height: 16)
+        wHead.frame = NSRect(x: pad, y: 296, width: fw, height: 16)
         content.addSubview(wHead)
 
         whisperStatusLabel = label("", size: 12)
-        whisperStatusLabel.frame = NSRect(x: pad, y: 236, width: fw - 100, height: 16)
+        whisperStatusLabel.frame = NSRect(x: pad, y: 274, width: fw - 100, height: 16)
         content.addSubview(whisperStatusLabel)
 
         let wChangeBtn = NSButton(title: "Change…", target: self, action: #selector(changeWhisperPath))
-        wChangeBtn.frame = NSRect(x: W - pad - 90, y: 232, width: 90, height: 24)
+        wChangeBtn.frame = NSRect(x: W - pad - 90, y: 270, width: 90, height: 24)
         wChangeBtn.controlSize = .small
         content.addSubview(wChangeBtn)
 
+        // Step 1 — Install Homebrew (shown only when brew is missing)
+        installBrewButton = NSButton(
+            title: "1.  Install Homebrew…",
+            target: self, action: #selector(installHomebrew))
+        installBrewButton.frame = NSRect(x: pad, y: 236, width: fw, height: 28)
+        content.addSubview(installBrewButton)
+
+        installBrewHint = label("Opens Terminal: /bin/bash -c \"$(curl … Homebrew/install)\"", size: 11)
+        installBrewHint.textColor = .tertiaryLabelColor
+        installBrewHint.frame = NSRect(x: pad, y: 220, width: fw, height: 14)
+        content.addSubview(installBrewHint)
+
+        // Step 2 — Install whisper-cpp
         installWhisperButton = NSButton(
             title: "Install whisper-cpp via Homebrew…",
             target: self, action: #selector(installWhisperCpp))
-        installWhisperButton.frame = NSRect(x: pad, y: 198, width: fw, height: 28)
+        installWhisperButton.frame = NSRect(x: pad, y: 198, width: fw, height: 28)  // shifts up when brew row hidden
         content.addSubview(installWhisperButton)
 
-        let hint = label("Opens Terminal and runs: brew install whisper-cpp", size: 11)
-        hint.textColor = .tertiaryLabelColor
-        hint.frame = NSRect(x: pad, y: 182, width: fw, height: 14)
-        content.addSubview(hint)
+        installWhisperHint = label("Opens Terminal and runs: brew install whisper-cpp", size: 11)
+        installWhisperHint.textColor = .tertiaryLabelColor
+        installWhisperHint.frame = NSRect(x: pad, y: 182, width: fw, height: 14)
+        content.addSubview(installWhisperHint)
 
         content.addSubview(sep(y: 168))
 
@@ -121,25 +137,44 @@ class WhisperSetupWindowController: NSWindowController {
 
     func refresh() {
         let t = Transcriber.shared
-        let brewFound = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/brew")
-                     || FileManager.default.fileExists(atPath: "/usr/local/bin/brew")
+        let fm = FileManager.default
+        let brewPath = resolvedBrewPath()
 
+        // ── whisper status ───────────────────────────────────────────────────
         if let wp = t.resolvedWhisperPath {
             whisperStatusLabel.stringValue = "✅ \(shorten(wp))"
             whisperStatusLabel.textColor = .labelColor
-            installWhisperButton.isEnabled = false
-            installWhisperButton.title = "whisper-cpp already installed"
-        } else {
+            // whisper is installed — hide both install steps
+            installBrewButton.isHidden = true
+            installBrewHint.isHidden = true
+            installWhisperButton.isHidden = true
+            installWhisperHint.isHidden = true
+        } else if let _ = brewPath {
+            // Homebrew found, whisper missing → show step 2 only
             whisperStatusLabel.stringValue = "❌ Not found"
             whisperStatusLabel.textColor = .systemRed
-            installWhisperButton.isEnabled = brewFound
-            installWhisperButton.title = brewFound
-                ? "Install whisper-cpp via Homebrew…"
-                : "Install whisper-cpp via Homebrew…  (Homebrew not found)"
+            installBrewButton.isHidden = true
+            installBrewHint.isHidden = true
+            installWhisperButton.isHidden = false
+            installWhisperButton.isEnabled = true
+            installWhisperButton.title = "Install whisper-cpp via Homebrew…"
+            installWhisperHint.isHidden = false
+        } else {
+            // No Homebrew at all → show both steps
+            whisperStatusLabel.stringValue = "❌ Not found  (Homebrew required)"
+            whisperStatusLabel.textColor = .systemRed
+            installBrewButton.isHidden = false
+            installBrewButton.isEnabled = true
+            installBrewHint.isHidden = false
+            installWhisperButton.isHidden = false
+            installWhisperButton.isEnabled = false
+            installWhisperButton.title = "2.  Install whisper-cpp via Homebrew…"
+            installWhisperHint.isHidden = false
         }
 
+        // ── model status ─────────────────────────────────────────────────────
         let mp = t.resolvedModelPath
-        if FileManager.default.fileExists(atPath: mp) {
+        if fm.fileExists(atPath: mp) {
             modelStatusLabel.stringValue = "✅ \(shorten(mp))"
             modelStatusLabel.textColor = .labelColor
             downloadButton.isEnabled = false
@@ -154,44 +189,57 @@ class WhisperSetupWindowController: NSWindowController {
 
     // MARK: - Actions
 
-    @objc private func installWhisperCpp() {
-        let brew = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/brew")
-            ? "/opt/homebrew/bin/brew"
-            : "/usr/local/bin/brew"
+    @objc private func installHomebrew() {
+        let cmd = "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        runInTerminal(cmd) {
+            // After Homebrew installs, poll until brew binary appears
+            self.pollUntil(
+                condition: { self.resolvedBrewPath() != nil },
+                then: { self.refresh() }
+            )
+        }
+    }
 
-        let cmd = "\(brew) install whisper-cpp"
+    @objc private func installWhisperCpp() {
+        guard let brew = resolvedBrewPath() else { return }
+        runInTerminal("\(brew) install whisper-cpp") {
+            self.pollUntil(
+                condition: { Transcriber.shared.resolvedWhisperPath != nil },
+                then: { self.refresh() }
+            )
+        }
+    }
+
+    // Opens Terminal with `cmd`. Calls `onSuccess` if AppleScript succeeded; copies to clipboard otherwise.
+    private func runInTerminal(_ cmd: String, onSuccess: @escaping () -> Void) {
         let script = """
         tell application "Terminal"
             activate
-            do script "\(cmd)"
+            do script "\(cmd.replacingOccurrences(of: "\"", with: "\\\""))"
         end tell
         """
         var err: NSDictionary?
         NSAppleScript(source: script)?.executeAndReturnError(&err)
-
-        if let err {
-            // Terminal AppleScript failed — copy command to clipboard instead
+        if err != nil {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(cmd, forType: .string)
             let alert = NSAlert()
-            alert.messageText = "Could not open Terminal"
-            alert.informativeText = "Command copied to clipboard:\n\(cmd)\n\nPaste it in Terminal to install."
+            alert.messageText = "Could not open Terminal automatically"
+            alert.informativeText = "Command copied to clipboard — paste it in Terminal:\n\n\(cmd)"
             alert.runModal()
         } else {
-            // Poll until whisper-cli appears, then refresh
-            checkForWhisperAfterInstall()
+            onSuccess()
         }
     }
 
-    private func checkForWhisperAfterInstall() {
+    /// Polls every 5 s (background) until `condition` is true, then calls `then` on main thread.
+    private func pollUntil(condition: @escaping () -> Bool, then: @escaping () -> Void) {
         DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
-            let found = Transcriber.shared.resolvedWhisperPath != nil
-            DispatchQueue.main.async {
-                if found {
-                    self?.refresh()
-                } else {
-                    self?.checkForWhisperAfterInstall()
-                }
+            guard self != nil else { return }
+            if condition() {
+                DispatchQueue.main.async { then() }
+            } else {
+                self?.pollUntil(condition: condition, then: then)
             }
         }
     }
@@ -247,6 +295,14 @@ class WhisperSetupWindowController: NSWindowController {
     }
 
     @objc private func closeWindow() { close() }
+
+    // MARK: - Helpers
+
+    private func resolvedBrewPath() -> String? {
+        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].first {
+            FileManager.default.fileExists(atPath: $0)
+        }
+    }
 
     private func shorten(_ path: String) -> String {
         path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
