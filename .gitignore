@@ -1,6 +1,7 @@
 .build/
 .swiftpm/
 *.app
+*.app.zip
 *.xcodeproj
 xcuserdata/
 DerivedData/
