@@ -24,9 +24,10 @@ class Transcriber {
     }()
 
     /// Minimum audio duration (seconds) for a track to be considered usable.
-    /// A mic file that only captured the first few seconds (silent failure) must not
-    /// be merged with a full system track — that produces garbage output.
-    private let minTrackDuration: Double = 30.0
+    /// At this level we only filter out tracks that are effectively empty (ffmpeg produced
+    /// a zero-sample file, recorder died before first buffer). Real short calls — even
+    /// a few seconds — still get transcribed.
+    private let minTrackDuration: Double = 1.0
 
     /// Hard cap for a single whisper/ffmpeg invocation (seconds). Prevents runaway jobs.
     private let processTimeout: TimeInterval = 3600

@@ -1,52 +1,47 @@
 import Foundation
 import CoreAudio
+import AppKit
+import Darwin
 
-/// Detects active calls by monitoring microphone usage.
-/// When the mic is grabbed by another process (Zoom, Teams, FaceTime, etc.)
-/// we treat that as a call in progress.
+/// Detects active calls by watching which *other* processes hold the microphone input.
 ///
-/// During recording, the detector switches to "recording mode":
-/// it cannot use mic polling (our own AVAudioEngine keeps isRunning=true),
-/// so it relies on system audio silence to detect call end.
+/// Uses the per-process CoreAudio API (macOS 14.2+): `kAudioHardwarePropertyProcessObjectList`
+/// + `kAudioProcessPropertyIsRunningInput` + `kAudioProcessPropertyPID`. We filter out our
+/// own PID, so our MicRecorder's AVAudioEngine does not mask call-end.
+///
+/// Silence-based signals (system audio, mic RMS) are kept as informational callbacks but no
+/// longer drive call-end decisions — a call app releases its own mic when the meeting ends,
+/// while ambient room noise through our mic engine can keep RMS above threshold indefinitely.
 class CallDetector {
     var onCallStarted: (() -> Void)?
     var onCallEnded: (() -> Void)?
 
     private var timer: Timer?
-    private var micInUse = false
     private let pollInterval: TimeInterval = 2.0
 
     /// How many consecutive polls must agree before we change state.
     private let debounceCount = 2
     private var activeCount = 0
     private var inactiveCount = 0
+    private var callActive = false
 
-    // --- Recording mode ---
     private var recordingMode = false
-    /// Timestamp when recording started (to enforce minimum recording duration)
     private var recordingStartTime: Date?
 
-    /// System audio has been silent long enough — set by RecordingManager
+    // Retained informational state (from RecordingManager callbacks). Not used for call-end.
     private(set) var systemAudioSilent = false
-    /// Mic has been silent long enough — set by RecordingManager
     private(set) var micSilent = false
-    /// True while system audio is a usable end-of-call signal. Set to false when the
-    /// SystemAudioRecorder reports that no system audio ever arrived (mic-only session).
     private(set) var systemAudioAvailable = true
 
-    /// Minimum recording duration before auto-stop is considered (seconds).
-    /// Must be longer than SCStream warmup (~30s) + silence threshold
-    /// to avoid false call-end detection from startup silence.
-    private let minRecordingDuration: TimeInterval = 60.0
+    private let ourPID: pid_t = getpid()
 
     func startMonitoring() {
         stopMonitoring()
-        recordingMode = false
         timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            self?.checkMicStatus()
+            self?.checkStatus()
         }
         timer?.tolerance = 0.5
-        log("[CallDetector] Started monitoring (poll every \(pollInterval)s)")
+        log("[CallDetector] Started monitoring (poll every \(pollInterval)s, our pid=\(ourPID))")
     }
 
     func stopMonitoring() {
@@ -55,18 +50,15 @@ class CallDetector {
         log("[CallDetector] Stopped monitoring")
     }
 
-    /// Switch to recording mode — mic polling stops, silence-based detection takes over.
     func enterRecordingMode() {
         recordingMode = true
+        recordingStartTime = Date()
         systemAudioSilent = false
         micSilent = false
         systemAudioAvailable = true
-        recordingStartTime = Date()
-        // Keep timer running but checkMicStatus will skip in recording mode
         log("[CallDetector] Entered recording mode")
     }
 
-    /// Exit recording mode, resume normal mic polling.
     func exitRecordingMode() {
         recordingMode = false
         recordingStartTime = nil
@@ -75,74 +67,39 @@ class CallDetector {
         systemAudioAvailable = true
         activeCount = 0
         inactiveCount = 0
-        micInUse = false
+        callActive = false
         log("[CallDetector] Exited recording mode, resumed normal monitoring")
     }
 
-    /// Called by RecordingManager when system audio silence state changes.
+    // MARK: - Informational callbacks (no-op for call-end, kept for logging / future use)
+
     func reportSystemAudioSilence(_ silent: Bool) {
-        let changed = systemAudioSilent != silent
-        systemAudioSilent = silent
-        if changed {
+        if systemAudioSilent != silent {
+            systemAudioSilent = silent
             log("[CallDetector] System audio silence: \(silent)")
-            if silent && recordingMode {
-                tryEndCall()
-            }
         }
     }
 
-    /// Called by RecordingManager when mic silence state changes (speaker is quiet / muted).
     func reportMicSilence(_ silent: Bool) {
-        let changed = micSilent != silent
-        micSilent = silent
-        if changed {
+        if micSilent != silent {
+            micSilent = silent
             log("[CallDetector] Mic silence: \(silent)")
-            if silent && recordingMode {
-                tryEndCall()
-            }
         }
     }
 
-    /// Called by RecordingManager when we learn the session has no system audio at all
-    /// (voice memo, headphones-only call). From this point end-of-call is decided by mic alone.
     func reportSystemAudioUnavailable() {
-        guard recordingMode, systemAudioAvailable else { return }
+        guard systemAudioAvailable else { return }
         systemAudioAvailable = false
-        log("[CallDetector] System audio unavailable — call-end gated on mic silence only")
-        tryEndCall()
+        log("[CallDetector] System audio unavailable (mic-only session)")
     }
 
-    private func tryEndCall() {
-        guard recordingMode else { return }
-        // Require mic silence. If system audio is available, also require system silence
-        // (AND-gate) — a brief lull on one side of the call is not the end of the call.
-        let systemCondition = !systemAudioAvailable || systemAudioSilent
-        guard micSilent, systemCondition else { return }
+    // MARK: - Poll
 
-        if let start = recordingStartTime,
-           Date().timeIntervalSince(start) >= minRecordingDuration {
-            let reason = systemAudioAvailable
-                ? "mic & system silent"
-                : "mic silent, system unavailable"
-            log("[CallDetector] Call ended (\(reason), recording >\(Int(minRecordingDuration))s)")
-            onCallEnded?()
-        } else if let start = recordingStartTime {
-            let remaining = minRecordingDuration - Date().timeIntervalSince(start) + 1.0
-            log("[CallDetector] Silence detected but recording too short, will retry in \(Int(remaining))s")
-            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
-                self?.tryEndCall()
-            }
-        }
-    }
+    private func checkStatus() {
+        let foreign = foreignMicHolders()
+        let inCall = !foreign.isEmpty
 
-    // MARK: - Normal mode (not recording)
-
-    private func checkMicStatus() {
-        guard !recordingMode else { return }
-
-        let inUse = isMicrophoneInUse()
-
-        if inUse {
+        if inCall {
             activeCount += 1
             inactiveCount = 0
         } else {
@@ -150,51 +107,114 @@ class CallDetector {
             activeCount = 0
         }
 
-        if activeCount >= debounceCount && !micInUse {
-            micInUse = true
-            log("[CallDetector] Mic active for \(debounceCount) polls — call detected")
-            onCallStarted?()
-        } else if inactiveCount >= debounceCount && micInUse {
-            micInUse = false
-            log("[CallDetector] Mic inactive for \(debounceCount) polls — call ended")
+        if !callActive && activeCount >= debounceCount {
+            callActive = true
+            if !recordingMode {
+                let who = foreign.map { $0.label }.joined(separator: ", ")
+                log("[CallDetector] Mic captured by \(who) — call detected")
+                onCallStarted?()
+            }
+            return
+        }
+
+        if callActive && inactiveCount >= debounceCount {
+            callActive = false
+            log("[CallDetector] \(recordingMode ? "No other process holds mic" : "Mic released") — call ended")
             onCallEnded?()
         }
     }
 
-    // MARK: - CoreAudio mic query
+    // MARK: - Per-process CoreAudio query
 
-    /// Check if the default input device is being used by any process.
-    func isMicrophoneInUse() -> Bool {
-        var defaultDeviceID = AudioDeviceID(0)
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    private struct ForeignMicHolder {
+        let pid: pid_t
+        var label: String {
+            if let app = NSRunningApplication(processIdentifier: pid),
+               let name = app.localizedName ?? app.bundleIdentifier {
+                return "\(name) (pid \(pid))"
+            }
+            return "pid \(pid)"
+        }
+    }
 
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+    /// Enumerates audio process objects and returns ones (other than us) capturing mic input.
+    private func foreignMicHolders() -> [ForeignMicHolder] {
+        var listAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-
-        let status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address, 0, nil, &size, &defaultDeviceID
-        )
-        guard status == noErr, defaultDeviceID != kAudioObjectUnknown else {
-            return false
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &listAddress, 0, nil, &size
+        ) == noErr, size > 0 else {
+            return []
         }
 
-        var isRunning: UInt32 = 0
-        size = UInt32(MemoryLayout<UInt32>.size)
-        var runningAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var objects = [AudioObjectID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &listAddress, 0, nil, &size, &objects
+        ) == noErr else {
+            return []
+        }
+
+        var holders: [ForeignMicHolder] = []
+        for obj in objects {
+            guard processIsRunningInput(obj) else { continue }
+            let pid = processPID(obj)
+            guard pid > 0, pid != ourPID else { continue }
+            guard isUserFacingProcess(pid: pid) else { continue }
+            holders.append(ForeignMicHolder(pid: pid))
+        }
+        return holders
+    }
+
+    /// Returns false for system daemons (corespeechd, assistantd, coreaudiod, etc.) that
+    /// hold the mic for background OS features like Siri / dictation and should never be
+    /// treated as call activity. Anything shipping from /System or /usr/libexec qualifies.
+    private func isUserFacingProcess(pid: pid_t) -> Bool {
+        guard let path = executablePath(pid: pid) else { return false }
+        if path.hasPrefix("/System/") { return false }
+        if path.hasPrefix("/usr/libexec/") { return false }
+        if path.hasPrefix("/usr/sbin/") { return false }
+        if path.hasPrefix("/usr/bin/") { return false }
+        return true
+    }
+
+    private func executablePath(pid: pid_t) -> String? {
+        // PROC_PIDPATHINFO_MAXSIZE = 4 * MAXPATHLEN, plenty for any real path
+        var buffer = [CChar](repeating: 0, count: 4 * 1024)
+        let bytes = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard bytes > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private func processIsRunningInput(_ object: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyIsRunningInput,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var value: UInt32 = 0
+        guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr else {
+            return false
+        }
+        return value != 0
+    }
 
-        let runStatus = AudioObjectGetPropertyData(
-            defaultDeviceID, &runningAddress, 0, nil, &size, &isRunning
+    private func processPID(_ object: AudioObjectID) -> pid_t {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyPID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
         )
-        guard runStatus == noErr else { return false }
-
-        return isRunning != 0
+        var size = UInt32(MemoryLayout<pid_t>.size)
+        var pid: pid_t = 0
+        guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &pid) == noErr else {
+            return 0
+        }
+        return pid
     }
 }
