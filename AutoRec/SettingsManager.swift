@@ -76,6 +76,20 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "excludedBundleIds") }
     }
 
+    // MARK: - Whisper / Transcription
+
+    /// Custom whisper-cli binary path override. Empty = auto-detect from common locations.
+    var whisperPath: String {
+        get { defaults.string(forKey: "whisperPath") ?? "" }
+        set { defaults.set(newValue, forKey: "whisperPath") }
+    }
+
+    /// Custom Whisper model file path override. Empty = use default ~/.local/share/whisper-models/.
+    var modelPath: String {
+        get { defaults.string(forKey: "modelPath") ?? "" }
+        set { defaults.set(newValue, forKey: "modelPath") }
+    }
+
     // MARK: - Helpers
 
     func ensureOutputDirectory() {

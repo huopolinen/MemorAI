@@ -5,47 +5,61 @@ import Foundation
 class Transcriber {
     static let shared = Transcriber()
 
-    private let whisperPath = "/usr/local/bin/whisper-cli"
     private let ffmpegPath: String = {
-        // Try common paths
-        for path in ["/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"] {
+        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
             if FileManager.default.fileExists(atPath: path) { return path }
         }
         return "ffmpeg"
     }()
 
-    /// Prefer medium model (better Russian accuracy). Fall back to base if medium is missing.
-    private let modelPath: String = {
+    private static let whisperCandidates = [
+        "/opt/homebrew/bin/whisper-cli",  // Apple Silicon Homebrew
+        "/usr/local/bin/whisper-cli",     // Intel Homebrew
+        "/opt/local/bin/whisper-cli",     // MacPorts
+    ]
+
+    static let defaultModelDir = NSString("~/.local/share/whisper-models").expandingTildeInPath
+
+    /// Resolved whisper-cli path (user override or auto-detected). Nil if not found.
+    var resolvedWhisperPath: String? {
+        let custom = SettingsManager.shared.whisperPath
+        if !custom.isEmpty {
+            return FileManager.default.fileExists(atPath: custom) ? custom : nil
+        }
+        return Self.whisperCandidates.first { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    /// Resolved model file path. May point to a file that doesn't exist yet (for download target).
+    var resolvedModelPath: String {
+        let custom = SettingsManager.shared.modelPath
+        if !custom.isEmpty { return custom }
         let fm = FileManager.default
-        let medium = NSString("~/.local/share/whisper-models/ggml-medium.bin").expandingTildeInPath
-        let base = NSString("~/.local/share/whisper-models/ggml-base.bin").expandingTildeInPath
+        let medium = (Self.defaultModelDir as NSString).appendingPathComponent("ggml-medium.bin")
+        let base = (Self.defaultModelDir as NSString).appendingPathComponent("ggml-base.bin")
         if fm.fileExists(atPath: medium) { return medium }
         return base
-    }()
+    }
 
-    /// Minimum audio duration (seconds) for a track to be considered usable.
-    /// At this level we only filter out tracks that are effectively empty (ffmpeg produced
-    /// a zero-sample file, recorder died before first buffer). Real short calls — even
-    /// a few seconds — still get transcribed.
     private let minTrackDuration: Double = 1.0
-
-    /// Hard cap for a single whisper/ffmpeg invocation (seconds). Prevents runaway jobs.
     private let processTimeout: TimeInterval = 3600
 
     var isAvailable: Bool {
-        FileManager.default.fileExists(atPath: whisperPath) &&
-        FileManager.default.fileExists(atPath: modelPath)
+        guard let wp = resolvedWhisperPath else { return false }
+        return FileManager.default.fileExists(atPath: wp) &&
+               FileManager.default.fileExists(atPath: resolvedModelPath)
     }
 
     /// Transcribe a recording session by merging mic + system audio into one file.
     /// Splits into 10-minute chunks to prevent whisper hallucination loops on long recordings.
     func transcribeSession(micURL: URL?, systemURL: URL?, completion: @escaping () -> Void) {
         DispatchQueue.global(qos: .utility).async { [self] in
-            guard isAvailable else {
-                log("[Transcriber] whisper-cli or model not found (model: \(modelPath))")
+            guard isAvailable, let wp = resolvedWhisperPath else {
+                log("[Transcriber] whisper-cli or model not found — skipping (whisper: \(resolvedWhisperPath ?? "not found"), model: \(resolvedModelPath))")
                 DispatchQueue.main.async { completion() }
                 return
             }
+            let whisperExec = wp
+            let modelFile = resolvedModelPath
 
             let micDur = trackDuration(micURL)
             let sysDur = trackDuration(systemURL)
@@ -119,10 +133,10 @@ class Transcriber {
             var fullTranscript = ""
 
             if duration <= chunkSec * 1.5 {
-                log("[Transcriber] Transcribing merged audio (\(Int(duration))s, model: \((modelPath as NSString).lastPathComponent))...")
+                log("[Transcriber] Transcribing merged audio (\(Int(duration))s, model: \((modelFile as NSString).lastPathComponent))...")
                 let tmpBase = dir.appendingPathComponent("_whisper_tmp")
-                let result = runProcess(whisperPath, args: [
-                    "-m", modelPath, "-l", lang,
+                let result = runProcess(whisperExec, args: [
+                    "-m", modelFile, "-l", lang,
                     "-et", "2.2", "-lpt", "-0.5",
                     "-otxt", "-of", tmpBase.path,
                     mergedWav.path
@@ -136,7 +150,7 @@ class Transcriber {
                 try? FileManager.default.removeItem(at: tmpBase.appendingPathExtension("txt"))
             } else {
                 let chunks = Int(ceil(duration / chunkSec))
-                log("[Transcriber] Transcribing \(chunks) chunks (\(Int(duration))s total, model: \((modelPath as NSString).lastPathComponent))...")
+                log("[Transcriber] Transcribing \(chunks) chunks (\(Int(duration))s total, model: \((modelFile as NSString).lastPathComponent))...")
 
                 for i in 0..<chunks {
                     let offset = Double(i) * chunkSec
@@ -154,8 +168,8 @@ class Transcriber {
                     }
 
                     log("[Transcriber]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s…")
-                    let result = runProcess(whisperPath, args: [
-                        "-m", modelPath, "-l", lang,
+                    let result = runProcess(whisperExec, args: [
+                        "-m", modelFile, "-l", lang,
                         "-et", "2.2", "-lpt", "-0.5",
                         "-otxt", "-of", chunkBase.path,
                         chunkWav.path
@@ -252,6 +266,61 @@ class Transcriber {
         let removed = lines.count - result.count
         if removed > 0 {
             log("[Transcriber] Dedup: removed \(removed) hallucinated lines")
+        }
+    }
+
+    // MARK: - Model Download
+
+    func downloadBaseModel(progress: @escaping (Double) -> Void, completion: @escaping (Error?) -> Void) {
+        let urlString = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+        guard let url = URL(string: urlString) else { return }
+
+        let destDir = Self.defaultModelDir
+        let destPath = (destDir as NSString).appendingPathComponent("ggml-base.bin")
+        try? FileManager.default.createDirectory(atPath: destDir, withIntermediateDirectories: true)
+
+        let delegate = DownloadDelegate(destPath: destPath, progress: progress, completion: completion)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: .main)
+        activeDownloadDelegate = delegate
+        session.downloadTask(with: url).resume()
+    }
+
+    private var activeDownloadDelegate: DownloadDelegate?
+
+    private class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
+        private let destPath: String
+        private let progressHandler: (Double) -> Void
+        private let completionHandler: (Error?) -> Void
+
+        init(destPath: String, progress: @escaping (Double) -> Void, completion: @escaping (Error?) -> Void) {
+            self.destPath = destPath
+            self.progressHandler = progress
+            self.completionHandler = completion
+        }
+
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                        didWriteData _: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite total: Int64) {
+            let fraction = total > 0 ? Double(totalBytesWritten) / Double(total) : 0
+            DispatchQueue.main.async { self.progressHandler(fraction) }
+        }
+
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+            do {
+                let dest = URL(fileURLWithPath: destPath)
+                if FileManager.default.fileExists(atPath: destPath) {
+                    try FileManager.default.removeItem(at: dest)
+                }
+                try FileManager.default.moveItem(at: location, to: dest)
+                DispatchQueue.main.async { self.completionHandler(nil) }
+            } catch {
+                DispatchQueue.main.async { self.completionHandler(error) }
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error = error {
+                DispatchQueue.main.async { self.completionHandler(error) }
+            }
         }
     }
 

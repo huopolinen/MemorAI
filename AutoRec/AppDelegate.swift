@@ -7,6 +7,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var callDetector: CallDetector!
     private var screenMemory: ScreenMemoryManager!
     private let settings = SettingsManager.shared
+    private var whisperAlertShown = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -50,6 +51,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             callDetector.startMonitoring()
         }
 
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.checkTranscriptionSetup()
+        }
+    }
+
+    private func checkTranscriptionSetup() {
+        guard !whisperAlertShown else { return }
+        guard settings.autoTranscribe else { return }
+        guard !Transcriber.shared.isAvailable else { return }
+        whisperAlertShown = true
+
+        let t = Transcriber.shared
+        let alert = NSAlert()
+        alert.addButton(withTitle: "Open Setup")
+        alert.addButton(withTitle: "Dismiss")
+        if t.resolvedWhisperPath == nil {
+            alert.messageText = "whisper-cpp not installed"
+            alert.informativeText = "Auto-transcription requires whisper-cpp.\n\nIn Setup you can install it automatically via Homebrew, or set a custom path."
+        } else {
+            alert.messageText = "Whisper model not found"
+            alert.informativeText = "whisper-cli is ready but no model file was found.\n\nIn Setup you can download ggml-base (~150 MB) in one click."
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            WhisperSetupWindowController.shared.show()
+        }
     }
 
     // MARK: - Permissions
@@ -119,16 +146,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let videoItem = addMenuItem(menu, "Record Screen (Calls)", #selector(toggleRecordScreen))
         videoItem.state = settings.recordScreen ? .on : .off
 
+        let t = Transcriber.shared
         let transcribeItem = NSMenuItem(title: "Auto-transcribe (Whisper)", action: #selector(toggleAutoTranscribe), keyEquivalent: "")
         transcribeItem.target = self
-        if Transcriber.shared.isAvailable {
+        if t.isAvailable {
             transcribeItem.state = settings.autoTranscribe ? .on : .off
         } else {
             transcribeItem.state = .off
             transcribeItem.isEnabled = false
-            transcribeItem.title = "Auto-transcribe (whisper-cpp not found)"
+            if t.resolvedWhisperPath == nil {
+                transcribeItem.title = "Auto-transcribe (whisper-cpp not installed)"
+            } else {
+                transcribeItem.title = "Auto-transcribe (model not found)"
+            }
         }
         menu.addItem(transcribeItem)
+
+        let setupItem = NSMenuItem(title: "Whisper Setup…", action: #selector(openWhisperSetup), keyEquivalent: "")
+        setupItem.target = self
+        menu.addItem(setupItem)
 
         // --- Screen Memory Section ---
         menu.addItem(.separator())
@@ -287,6 +323,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleAutoTranscribe() {
         settings.autoTranscribe.toggle()
         updateMenu()
+    }
+
+    @objc private func openWhisperSetup() {
+        WhisperSetupWindowController.shared.show()
     }
 
     // MARK: - Screen Memory Actions
