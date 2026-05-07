@@ -11,8 +11,6 @@ import AVFoundation
 class MicRecorder {
     private var engine: AVAudioEngine?
     private var audioFile: AVAudioFile?
-    private var converter: AVAudioConverter?
-    private var targetFormat: AVAudioFormat?
     private var isRecording = false
     var isPaused = false
     private let outputURL: URL
@@ -61,30 +59,21 @@ class MicRecorder {
             throw MicRecorderError.noMicAvailable
         }
 
-        // Target: 48kHz mono Float32. The tap delivers buffers in the input device's native
-        // format (often 96kHz stereo), which doesn't match the AVAudioFile's processing
-        // format and used to silently halve the recorded duration. AVAudioConverter
-        // resamples + downmixes each buffer before writing.
-        let target = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: 48000,
-            channels: 1,
-            interleaved: false
-        )
-        guard let target = target, let conv = AVAudioConverter(from: recordingFormat, to: target) else {
-            throw MicRecorderError.noMicAvailable
-        }
-        self.targetFormat = target
-        self.converter = conv
+        // Match the file's encoding format to the input device's native rate and channel
+        // count. The tap delivers buffers in the device's native format (24/48/96 kHz, mono
+        // or stereo); writing them into a hardcoded 48 kHz mono AVAudioFile silently packed
+        // samples at the wrong rate and produced 2× speed audio (1.4.0/1.4.1) or empty files
+        // when manual AVAudioConverter conversion failed (1.4.2). Standard AAC accepts any
+        // sample rate and channel count, so writing in native format is reliable.
+        let nativeSampleRate = recordingFormat.sampleRate
+        let nativeChannels = recordingFormat.channelCount
 
         if audioFile == nil {
-            // HE-AAC (v1) — mono-capable. HE-AAC v2 requires stereo (parametric stereo),
-            // silently fails on mono writes.
             let fileSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC_HE,
-                AVSampleRateKey: 48000,
-                AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateKey: 32000,
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: nativeSampleRate,
+                AVNumberOfChannelsKey: nativeChannels,
+                AVEncoderBitRateKey: 32000 * Int(nativeChannels),
             ]
             self.audioFile = try AVAudioFile(
                 forWriting: outputURL,
@@ -99,10 +88,8 @@ class MicRecorder {
             self.lastBufferTime = Date()
             self.bufferCount &+= 1
 
-            guard let converted = self.convert(buffer) else { return }
-
             do {
-                try self.audioFile?.write(from: converted)
+                try self.audioFile?.write(from: buffer)
                 self.writeErrorCount = 0
             } catch {
                 self.writeErrorCount += 1
@@ -112,37 +99,14 @@ class MicRecorder {
                     self.stop()
                 }
             }
-            self.updateSilenceState(converted)
+            self.updateSilenceState(buffer)
         }
 
         try engine.start()
         self.engine = engine
         self.lastBufferTime = Date()
 
-        log("[MicRecorder] Engine started: input \(Int(recordingFormat.sampleRate))Hz/\(recordingFormat.channelCount)ch → file 48000Hz/1ch")
-    }
-
-    private func convert(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let converter = self.converter, let target = self.targetFormat else { return nil }
-        let ratio = target.sampleRate / input.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(input.frameLength) * ratio) + 1024
-        guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return nil }
-        var consumed = false
-        var error: NSError?
-        let status = converter.convert(to: output, error: &error) { _, outStatus in
-            if consumed {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            consumed = true
-            outStatus.pointee = .haveData
-            return input
-        }
-        if status == .error || error != nil {
-            log("[MicRecorder] ❌ Convert error: \(error?.localizedDescription ?? "unknown")")
-            return nil
-        }
-        return output
+        log("[MicRecorder] Engine started: \(Int(nativeSampleRate))Hz/\(nativeChannels)ch (native, no resampling)")
     }
 
     private func installConfigChangeObserver() {
@@ -199,8 +163,6 @@ class MicRecorder {
         engine?.stop()
         engine = nil
         audioFile = nil
-        converter = nil
-        targetFormat = nil
         silenceStart = nil
         isSilent = false
         log("[MicRecorder] Recording stopped (\(bufferCount) buffers total)")
