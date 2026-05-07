@@ -22,6 +22,7 @@ class RecordingManager {
     // Track current session file URLs for transcription
     private var currentMicURL: URL?
     private var currentSystemURL: URL?
+    private var currentScreenURL: URL?
 
     private(set) var isTranscribing = false
 
@@ -47,6 +48,7 @@ class RecordingManager {
 
         self.currentMicURL = micURL
         self.currentSystemURL = sysURL
+        self.currentScreenURL = vidURL
 
         Task {
             do {
@@ -110,6 +112,7 @@ class RecordingManager {
 
         let micURL = currentMicURL
         let sysURL = currentSystemURL
+        let screenURL = currentScreenURL
 
         Task {
             micRecorder?.stop()
@@ -119,6 +122,12 @@ class RecordingManager {
             setState(.idle)
             onRecordingActiveChanged?(false)
             log("[RecordingManager] All recorders stopped")
+
+            // Mux mic + system audio into screen.mp4 in-place so the video file is
+            // self-contained for downstream playback. Runs in parallel with transcription.
+            if let screenURL = screenURL {
+                AudioMuxer.shared.muxScreenWithAudio(screenURL: screenURL, micURL: micURL, systemURL: sysURL)
+            }
 
             // Auto-transcribe if enabled and whisper is available
             if settings.autoTranscribe {
