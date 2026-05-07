@@ -43,6 +43,10 @@ class Transcriber {
     private let minTrackDuration: Double = 1.0
     private let processTimeout: TimeInterval = 3600
 
+    /// Serial queue: running multiple whisper-cli jobs in parallel saturates CPU and
+    /// causes per-chunk timeouts (lost transcripts).
+    private let transcriptionQueue = DispatchQueue(label: "com.local.memorai.transcribe", qos: .utility)
+
     var isAvailable: Bool {
         guard let wp = resolvedWhisperPath else { return false }
         return FileManager.default.fileExists(atPath: wp) &&
@@ -52,7 +56,7 @@ class Transcriber {
     /// Transcribe a recording session by merging mic + system audio into one file.
     /// Splits into 10-minute chunks to prevent whisper hallucination loops on long recordings.
     func transcribeSession(micURL: URL?, systemURL: URL?, completion: @escaping () -> Void) {
-        DispatchQueue.global(qos: .utility).async { [self] in
+        transcriptionQueue.async { [self] in
             guard isAvailable, let wp = resolvedWhisperPath else {
                 log("[Transcriber] whisper-cli or model not found — skipping (whisper: \(resolvedWhisperPath ?? "not found"), model: \(resolvedModelPath))")
                 DispatchQueue.main.async { completion() }
@@ -77,6 +81,10 @@ class Transcriber {
             let refURL = (micOK ? micURL : systemURL)!
             let dir = refURL.deletingLastPathComponent()
             let baseName = refURL.deletingPathExtension().lastPathComponent
+            let sessionTag = baseName
+                .replacingOccurrences(of: "_mic", with: "")
+                .replacingOccurrences(of: "_system", with: "")
+                .replacingOccurrences(of: "call_", with: "")
             let transcriptBase = dir.appendingPathComponent(
                 baseName.replacingOccurrences(of: "_mic", with: "_transcript")
                         .replacingOccurrences(of: "_system", with: "_transcript")
@@ -150,12 +158,12 @@ class Transcriber {
                 try? FileManager.default.removeItem(at: tmpBase.appendingPathExtension("txt"))
             } else {
                 let chunks = Int(ceil(duration / chunkSec))
-                log("[Transcriber] Transcribing \(chunks) chunks (\(Int(duration))s total, model: \((modelFile as NSString).lastPathComponent))...")
+                log("[Transcriber] [\(sessionTag)] Transcribing \(chunks) chunks (\(Int(duration))s total, model: \((modelFile as NSString).lastPathComponent))...")
 
                 for i in 0..<chunks {
                     let offset = Double(i) * chunkSec
-                    let chunkWav = dir.appendingPathComponent("_chunk_\(i).wav")
-                    let chunkBase = dir.appendingPathComponent("_chunk_\(i)")
+                    let chunkWav = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i).wav")
+                    let chunkBase = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i)")
 
                     let extractResult = runProcess(ffmpegPath, args: [
                         "-y", "-i", mergedWav.path,
@@ -163,11 +171,11 @@ class Transcriber {
                         "-c:a", "pcm_s16le", chunkWav.path
                     ])
                     guard extractResult.exitCode == 0 else {
-                        log("[Transcriber] ⚠️ Chunk \(i+1) extraction failed, skipping")
+                        log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) extraction failed, skipping")
                         continue
                     }
 
-                    log("[Transcriber]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s…")
+                    log("[Transcriber] [\(sessionTag)]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s…")
                     let result = runProcess(whisperExec, args: [
                         "-m", modelFile, "-l", lang,
                         "-et", "2.2", "-lpt", "-0.5",
@@ -179,7 +187,7 @@ class Transcriber {
                        let text = try? String(contentsOf: chunkBase.appendingPathExtension("txt"), encoding: .utf8) {
                         fullTranscript += text
                     } else {
-                        log("[Transcriber] ⚠️ Chunk \(i+1) whisper failed (exit \(result.exitCode))")
+                        log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) whisper failed (exit \(result.exitCode))")
                     }
 
                     try? FileManager.default.removeItem(at: chunkWav)

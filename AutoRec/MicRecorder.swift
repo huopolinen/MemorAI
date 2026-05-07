@@ -11,6 +11,8 @@ import AVFoundation
 class MicRecorder {
     private var engine: AVAudioEngine?
     private var audioFile: AVAudioFile?
+    private var converter: AVAudioConverter?
+    private var targetFormat: AVAudioFormat?
     private var isRecording = false
     var isPaused = false
     private let outputURL: URL
@@ -59,6 +61,22 @@ class MicRecorder {
             throw MicRecorderError.noMicAvailable
         }
 
+        // Target: 48kHz mono Float32. The tap delivers buffers in the input device's native
+        // format (often 96kHz stereo), which doesn't match the AVAudioFile's processing
+        // format and used to silently halve the recorded duration. AVAudioConverter
+        // resamples + downmixes each buffer before writing.
+        let target = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48000,
+            channels: 1,
+            interleaved: false
+        )
+        guard let target = target, let conv = AVAudioConverter(from: recordingFormat, to: target) else {
+            throw MicRecorderError.noMicAvailable
+        }
+        self.targetFormat = target
+        self.converter = conv
+
         if audioFile == nil {
             // HE-AAC (v1) — mono-capable. HE-AAC v2 requires stereo (parametric stereo),
             // silently fails on mono writes.
@@ -68,15 +86,23 @@ class MicRecorder {
                 AVNumberOfChannelsKey: 1,
                 AVEncoderBitRateKey: 32000,
             ]
-            self.audioFile = try AVAudioFile(forWriting: outputURL, settings: fileSettings)
+            self.audioFile = try AVAudioFile(
+                forWriting: outputURL,
+                settings: fileSettings,
+                commonFormat: .pcmFormatFloat32,
+                interleaved: false
+            )
         }
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
             guard let self = self, self.isRecording, !self.isPaused else { return }
             self.lastBufferTime = Date()
             self.bufferCount &+= 1
+
+            guard let converted = self.convert(buffer) else { return }
+
             do {
-                try self.audioFile?.write(from: buffer)
+                try self.audioFile?.write(from: converted)
                 self.writeErrorCount = 0
             } catch {
                 self.writeErrorCount += 1
@@ -86,14 +112,37 @@ class MicRecorder {
                     self.stop()
                 }
             }
-            self.updateSilenceState(buffer)
+            self.updateSilenceState(converted)
         }
 
         try engine.start()
         self.engine = engine
         self.lastBufferTime = Date()
 
-        log("[MicRecorder] Engine started: \(Int(recordingFormat.sampleRate))Hz, \(recordingFormat.channelCount)ch")
+        log("[MicRecorder] Engine started: input \(Int(recordingFormat.sampleRate))Hz/\(recordingFormat.channelCount)ch → file 48000Hz/1ch")
+    }
+
+    private func convert(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let converter = self.converter, let target = self.targetFormat else { return nil }
+        let ratio = target.sampleRate / input.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(input.frameLength) * ratio) + 1024
+        guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return nil }
+        var consumed = false
+        var error: NSError?
+        let status = converter.convert(to: output, error: &error) { _, outStatus in
+            if consumed {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            consumed = true
+            outStatus.pointee = .haveData
+            return input
+        }
+        if status == .error || error != nil {
+            log("[MicRecorder] ❌ Convert error: \(error?.localizedDescription ?? "unknown")")
+            return nil
+        }
+        return output
     }
 
     private func installConfigChangeObserver() {
@@ -150,6 +199,8 @@ class MicRecorder {
         engine?.stop()
         engine = nil
         audioFile = nil
+        converter = nil
+        targetFormat = nil
         silenceStart = nil
         isSilent = false
         log("[MicRecorder] Recording stopped (\(bufferCount) buffers total)")
