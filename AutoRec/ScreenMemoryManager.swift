@@ -89,7 +89,7 @@ class ScreenMemoryManager {
 
         let base = timeFormatter.string(from: now)
         let imageURL = dayDir.appendingPathComponent("\(base).heif")
-        let jsonURL = dayDir.appendingPathComponent("\(base).json")
+        let jsonlURL = dayDir.appendingPathComponent("index.jsonl")
 
         guard !FileManager.default.fileExists(atPath: imageURL.path) else { return }
 
@@ -97,16 +97,11 @@ class ScreenMemoryManager {
         let savedURL = capturer.saveImage(image, to: imageURL)
         guard let savedURL = savedURL else { return }
 
-        var json = meta
-        json["timestamp"] = ISO8601DateFormatter().string(from: now)
-        json["image_file"] = savedURL.lastPathComponent
-        json["ocr_text"] = ""
+        var baseRecord = meta
+        baseRecord["timestamp"] = ISO8601DateFormatter().string(from: now)
+        baseRecord["image_file"] = savedURL.lastPathComponent
 
-        if let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: jsonURL)
-        }
-
-        ocrProcessor.process(imageURL: savedURL, jsonURL: jsonURL)
+        ocrProcessor.process(imageURL: savedURL, jsonlURL: jsonlURL, baseMeta: baseRecord)
     }
 
     // MARK: - Clipboard Polling (separate thread)

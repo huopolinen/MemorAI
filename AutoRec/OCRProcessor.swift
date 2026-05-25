@@ -5,44 +5,34 @@ import ImageIO
 class OCRProcessor {
     private let queue = DispatchQueue(label: "com.memorai.ocr", qos: .background)
 
-    func process(imageURL: URL, jsonURL: URL) {
+    func process(imageURL: URL, jsonlURL: URL, baseMeta: [String: Any]) {
         queue.async {
-            guard let src = CGImageSourceCreateWithURL(imageURL as CFURL, nil),
-                  let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
+            var record = baseMeta
 
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.recognitionLanguages = ["ru", "en"]
-            request.usesLanguageCorrection = true
-            // Use latest revision for best quality
-            request.revision = VNRecognizeTextRequestRevision3
+            if let src = CGImageSourceCreateWithURL(imageURL as CFURL, nil),
+               let image = CGImageSourceCreateImageAtIndex(src, 0, nil) {
 
-            let handler = VNImageRequestHandler(cgImage: image)
-            do {
-                try handler.perform([request])
-            } catch {
-                return
+                let request = VNRecognizeTextRequest()
+                request.recognitionLevel = .accurate
+                request.recognitionLanguages = ["ru", "en"]
+                request.usesLanguageCorrection = true
+                request.revision = VNRecognizeTextRequestRevision3
+
+                let handler = VNImageRequestHandler(cgImage: image)
+                if (try? handler.perform([request])) != nil,
+                   let results = request.results {
+                    let text = results.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+                    record["ocr_text"] = text
+
+                    let extracted = Self.extractStructuredData(from: text)
+                    if !extracted.urls.isEmpty { record["urls"] = extracted.urls }
+                    if !extracted.emails.isEmpty { record["emails"] = extracted.emails }
+                    if !extracted.phones.isEmpty { record["phones"] = extracted.phones }
+                    if !extracted.paths.isEmpty { record["file_paths"] = extracted.paths }
+                }
             }
 
-            guard let results = request.results else { return }
-            let text = results.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
-
-            // Extract structured data from OCR text
-            let extracted = Self.extractStructuredData(from: text)
-
-            // Update the JSON file
-            guard let data = try? Data(contentsOf: jsonURL),
-                  var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-
-            json["ocr_text"] = text
-            if !extracted.urls.isEmpty { json["urls"] = extracted.urls }
-            if !extracted.emails.isEmpty { json["emails"] = extracted.emails }
-            if !extracted.phones.isEmpty { json["phones"] = extracted.phones }
-            if !extracted.paths.isEmpty { json["file_paths"] = extracted.paths }
-
-            if let updated = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
-                try? updated.write(to: jsonURL)
-            }
+            JSONLWriter.shared.append(record, to: jsonlURL)
         }
     }
 

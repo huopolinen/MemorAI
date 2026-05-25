@@ -185,12 +185,11 @@ class SystemAudioRecorder: NSObject {
             let vWriter = try AVAssetWriter(outputURL: videoURL, fileType: .mp4)
 
             let vSettings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoCodecKey: AVVideoCodecType.hevc,
                 AVVideoWidthKey: frameW,
                 AVVideoHeightKey: frameH,
                 AVVideoCompressionPropertiesKey: [
-                    AVVideoAverageBitRateKey: 2_000_000,
-                    AVVideoProfileLevelKey: AVVideoProfileLevelH264MainAutoLevel,
+                    AVVideoAverageBitRateKey: 600_000,
                     AVVideoMaxKeyFrameIntervalKey: 30,
                 ] as [String: Any],
             ]
