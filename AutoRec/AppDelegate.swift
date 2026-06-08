@@ -12,6 +12,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
+        setupMainMenu()
         requestPermissions()
         settings.ensureOutputDirectory()
 
@@ -51,32 +52,67 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             callDetector.startMonitoring()
         }
 
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(settingsChanged),
+            name: .memorAISettingsChanged, object: nil)
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             self?.checkTranscriptionSetup()
         }
     }
 
+    /// Re-sync live behaviour after the Settings window changes something.
+    @objc private func settingsChanged() {
+        if settings.autoDetect { callDetector.startMonitoring() }
+        else { callDetector.stopMonitoring() }
+        updateMenu()
+    }
+
     private func checkTranscriptionSetup() {
         guard !whisperAlertShown else { return }
         guard settings.autoTranscribe else { return }
-        guard !Transcriber.shared.isAvailable else { return }
+        // Cloud engines are configured in Settings, not via this alert.
+        let kind = TranscriptionEngineKind(rawValue: settings.transcriptionEngine) ?? .whisperLocal
+        guard kind == .whisperLocal else { return }
+        let engine = WhisperLocalEngine.shared
+        guard !engine.isAvailable else { return }
         whisperAlertShown = true
 
-        let t = Transcriber.shared
         let alert = NSAlert()
         alert.addButton(withTitle: "Open Setup")
         alert.addButton(withTitle: "Dismiss")
-        if t.resolvedWhisperPath == nil {
+        if engine.resolvedWhisperPath == nil {
             alert.messageText = "whisper-cpp not installed"
-            alert.informativeText = "Auto-transcription requires whisper-cpp.\n\nIn Setup you can install it automatically via Homebrew, or set a custom path."
+            alert.informativeText = "Auto-transcription requires whisper-cpp.\n\nIn Setup you can install it automatically via Homebrew, or pick a free cloud engine (Groq / Gemini) in Settings."
         } else {
             alert.messageText = "Whisper model not found"
-            alert.informativeText = "whisper-cli is ready but no model file was found.\n\nIn Setup you can download ggml-base (~150 MB) in one click."
+            alert.informativeText = "whisper-cli is ready but no model file was found.\n\nIn Setup you can download a model in one click, or pick a free cloud engine in Settings."
         }
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
             WhisperSetupWindowController.shared.show()
         }
+    }
+
+    // MARK: - Main Menu
+
+    /// Accessory apps have no menu bar, so standard text-editing key equivalents
+    /// (⌘C/⌘V/⌘X/⌘A) never reach text fields. Installing a minimal Edit menu
+    /// restores them in windows like Settings.
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        NSApp.mainMenu = mainMenu
     }
 
     // MARK: - Permissions
@@ -146,25 +182,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let videoItem = addMenuItem(menu, "Record Screen (Calls)", #selector(toggleRecordScreen))
         videoItem.state = settings.recordScreen ? .on : .off
 
-        let t = Transcriber.shared
-        let transcribeItem = NSMenuItem(title: "Auto-transcribe (Whisper)", action: #selector(toggleAutoTranscribe), keyEquivalent: "")
+        let engine = TranscriptionEngineFactory.current()
+        let transcribeItem = NSMenuItem(title: "Auto-transcribe (\(engine.kind.shortName))", action: #selector(toggleAutoTranscribe), keyEquivalent: "")
         transcribeItem.target = self
-        if t.isAvailable {
+        if engine.isAvailable {
             transcribeItem.state = settings.autoTranscribe ? .on : .off
         } else {
             transcribeItem.state = .off
             transcribeItem.isEnabled = false
-            if t.resolvedWhisperPath == nil {
-                transcribeItem.title = "Auto-transcribe (whisper-cpp not installed)"
-            } else {
-                transcribeItem.title = "Auto-transcribe (model not found)"
-            }
+            transcribeItem.title = "Auto-transcribe (\(engine.kind.shortName): \(engine.unavailableReason ?? "не настроено"))"
         }
         menu.addItem(transcribeItem)
 
-        let setupItem = NSMenuItem(title: "Whisper Setup…", action: #selector(openWhisperSetup), keyEquivalent: "")
-        setupItem.target = self
-        menu.addItem(setupItem)
+        let settingsItem = NSMenuItem(title: "Настройки…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
 
         // --- Screen Memory Section ---
         menu.addItem(.separator())
@@ -325,8 +357,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateMenu()
     }
 
-    @objc private func openWhisperSetup() {
-        WhisperSetupWindowController.shared.show()
+    @objc private func openSettings() {
+        SettingsWindowController.shared.show()
     }
 
     // MARK: - Screen Memory Actions

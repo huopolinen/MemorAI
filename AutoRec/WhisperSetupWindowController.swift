@@ -1,7 +1,11 @@
 import Cocoa
 
+/// Setup window for the local Whisper engine: install whisper-cpp via Homebrew
+/// and download a ggml model (medium for quality, or base for size).
 class WhisperSetupWindowController: NSWindowController {
     static let shared = WhisperSetupWindowController()
+
+    private let engine = WhisperLocalEngine.shared
 
     private var whisperStatusLabel: NSTextField!
     private var installBrewButton: NSButton!
@@ -9,13 +13,14 @@ class WhisperSetupWindowController: NSWindowController {
     private var installWhisperButton: NSButton!
     private var installWhisperHint: NSTextField!
     private var modelStatusLabel: NSTextField!
-    private var downloadButton: NSButton!
+    private var downloadMediumButton: NSButton!
+    private var downloadBaseButton: NSButton!
     private var progressBar: NSProgressIndicator!
     private var progressLabel: NSTextField!
 
     private convenience init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 490, height: 358),
+            contentRect: NSRect(x: 0, y: 0, width: 490, height: 410),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -49,75 +54,75 @@ class WhisperSetupWindowController: NSWindowController {
         }
 
         // ── Title ────────────────────────────────────────────────────────────
-        let title = label("Whisper Transcription Setup", size: 14, bold: true)
-        title.frame = NSRect(x: pad, y: 320, width: fw, height: 20)
+        let title = label("Локальный Whisper", size: 14, bold: true)
+        title.frame = NSRect(x: pad, y: 372, width: fw, height: 20)
         content.addSubview(title)
 
         // ── whisper-cli section ──────────────────────────────────────────────
         let wHead = label("whisper-cli binary:", size: 11)
         wHead.textColor = .secondaryLabelColor
-        wHead.frame = NSRect(x: pad, y: 296, width: fw, height: 16)
+        wHead.frame = NSRect(x: pad, y: 348, width: fw, height: 16)
         content.addSubview(wHead)
 
         whisperStatusLabel = label("", size: 12)
-        whisperStatusLabel.frame = NSRect(x: pad, y: 274, width: fw - 100, height: 16)
+        whisperStatusLabel.frame = NSRect(x: pad, y: 326, width: fw - 100, height: 16)
         content.addSubview(whisperStatusLabel)
 
         let wChangeBtn = NSButton(title: "Change…", target: self, action: #selector(changeWhisperPath))
-        wChangeBtn.frame = NSRect(x: W - pad - 90, y: 270, width: 90, height: 24)
+        wChangeBtn.frame = NSRect(x: W - pad - 90, y: 322, width: 90, height: 24)
         wChangeBtn.controlSize = .small
         content.addSubview(wChangeBtn)
 
-        // Step 1 — Install Homebrew (shown only when brew is missing)
-        installBrewButton = NSButton(
-            title: "1.  Install Homebrew…",
-            target: self, action: #selector(installHomebrew))
-        installBrewButton.frame = NSRect(x: pad, y: 236, width: fw, height: 28)
+        installBrewButton = NSButton(title: "1.  Install Homebrew…", target: self, action: #selector(installHomebrew))
+        installBrewButton.frame = NSRect(x: pad, y: 288, width: fw, height: 28)
         content.addSubview(installBrewButton)
 
         installBrewHint = label("Opens Terminal: /bin/bash -c \"$(curl … Homebrew/install)\"", size: 11)
         installBrewHint.textColor = .tertiaryLabelColor
-        installBrewHint.frame = NSRect(x: pad, y: 220, width: fw, height: 14)
+        installBrewHint.frame = NSRect(x: pad, y: 272, width: fw, height: 14)
         content.addSubview(installBrewHint)
 
-        // Step 2 — Install whisper-cpp
-        installWhisperButton = NSButton(
-            title: "Install whisper-cpp via Homebrew…",
-            target: self, action: #selector(installWhisperCpp))
-        installWhisperButton.frame = NSRect(x: pad, y: 198, width: fw, height: 28)  // shifts up when brew row hidden
+        installWhisperButton = NSButton(title: "Install whisper-cpp via Homebrew…", target: self, action: #selector(installWhisperCpp))
+        installWhisperButton.frame = NSRect(x: pad, y: 250, width: fw, height: 28)
         content.addSubview(installWhisperButton)
 
         installWhisperHint = label("Opens Terminal and runs: brew install whisper-cpp", size: 11)
         installWhisperHint.textColor = .tertiaryLabelColor
-        installWhisperHint.frame = NSRect(x: pad, y: 182, width: fw, height: 14)
+        installWhisperHint.frame = NSRect(x: pad, y: 234, width: fw, height: 14)
         content.addSubview(installWhisperHint)
 
-        content.addSubview(sep(y: 168))
+        content.addSubview(sep(y: 220))
 
         // ── Model section ────────────────────────────────────────────────────
         let mHead = label("Model file:", size: 11)
         mHead.textColor = .secondaryLabelColor
-        mHead.frame = NSRect(x: pad, y: 148, width: fw, height: 16)
+        mHead.frame = NSRect(x: pad, y: 200, width: fw, height: 16)
         content.addSubview(mHead)
 
         modelStatusLabel = label("", size: 12)
-        modelStatusLabel.frame = NSRect(x: pad, y: 126, width: fw - 100, height: 16)
+        modelStatusLabel.frame = NSRect(x: pad, y: 178, width: fw - 100, height: 16)
         content.addSubview(modelStatusLabel)
 
         let mChangeBtn = NSButton(title: "Change…", target: self, action: #selector(changeModelPath))
-        mChangeBtn.frame = NSRect(x: W - pad - 90, y: 122, width: 90, height: 24)
+        mChangeBtn.frame = NSRect(x: W - pad - 90, y: 174, width: 90, height: 24)
         mChangeBtn.controlSize = .small
         content.addSubview(mChangeBtn)
 
-        content.addSubview(sep(y: 108))
+        let dlHead = label("Скачать модель (medium — заметно точнее base):", size: 11)
+        dlHead.textColor = .secondaryLabelColor
+        dlHead.frame = NSRect(x: pad, y: 150, width: fw, height: 14)
+        content.addSubview(dlHead)
 
-        downloadButton = NSButton(
-            title: "Download ggml-base.bin  (~150 MB)",
-            target: self, action: #selector(downloadModel))
-        downloadButton.frame = NSRect(x: pad, y: 74, width: fw, height: 28)
-        content.addSubview(downloadButton)
+        let halfW = (fw - 8) / 2
+        downloadMediumButton = NSButton(title: "medium  (~1.5 GB)", target: self, action: #selector(downloadMedium))
+        downloadMediumButton.frame = NSRect(x: pad, y: 120, width: halfW, height: 28)
+        content.addSubview(downloadMediumButton)
 
-        progressBar = NSProgressIndicator(frame: NSRect(x: pad, y: 54, width: fw, height: 14))
+        downloadBaseButton = NSButton(title: "base  (~150 MB)", target: self, action: #selector(downloadBase))
+        downloadBaseButton.frame = NSRect(x: pad + halfW + 8, y: 120, width: halfW, height: 28)
+        content.addSubview(downloadBaseButton)
+
+        progressBar = NSProgressIndicator(frame: NSRect(x: pad, y: 92, width: fw, height: 14))
         progressBar.minValue = 0; progressBar.maxValue = 1
         progressBar.isIndeterminate = false; progressBar.style = .bar
         progressBar.isHidden = true
@@ -125,32 +130,36 @@ class WhisperSetupWindowController: NSWindowController {
 
         progressLabel = label("", size: 11)
         progressLabel.textColor = .secondaryLabelColor
-        progressLabel.frame = NSRect(x: pad, y: 36, width: fw, height: 14)
+        progressLabel.frame = NSRect(x: pad, y: 72, width: fw, height: 14)
         progressLabel.isHidden = true
         content.addSubview(progressLabel)
 
-        // ── Close ────────────────────────────────────────────────────────────
+        content.addSubview(sep(y: 56))
+
+        let hint = label("Совет: для приватности — локальный Whisper; для лучшего качества выбери Groq или Gemini в Настройках.", size: 11)
+        hint.textColor = .tertiaryLabelColor
+        hint.lineBreakMode = .byWordWrapping
+        hint.frame = NSRect(x: pad, y: 40, width: fw, height: 14)
+        content.addSubview(hint)
+
         let closeBtn = NSButton(title: "Close", target: self, action: #selector(closeWindow))
         closeBtn.frame = NSRect(x: W - pad - 80, y: 8, width: 80, height: 28)
         content.addSubview(closeBtn)
     }
 
     func refresh() {
-        let t = Transcriber.shared
         let fm = FileManager.default
         let brewPath = resolvedBrewPath()
 
         // ── whisper status ───────────────────────────────────────────────────
-        if let wp = t.resolvedWhisperPath {
+        if let wp = engine.resolvedWhisperPath {
             whisperStatusLabel.stringValue = "✅ \(shorten(wp))"
             whisperStatusLabel.textColor = .labelColor
-            // whisper is installed — hide both install steps
             installBrewButton.isHidden = true
             installBrewHint.isHidden = true
             installWhisperButton.isHidden = true
             installWhisperHint.isHidden = true
-        } else if let _ = brewPath {
-            // Homebrew found, whisper missing → show step 2 only
+        } else if brewPath != nil {
             whisperStatusLabel.stringValue = "❌ Not found"
             whisperStatusLabel.textColor = .systemRed
             installBrewButton.isHidden = true
@@ -160,7 +169,6 @@ class WhisperSetupWindowController: NSWindowController {
             installWhisperButton.title = "Install whisper-cpp via Homebrew…"
             installWhisperHint.isHidden = false
         } else {
-            // No Homebrew at all → show both steps
             whisperStatusLabel.stringValue = "❌ Not found  (Homebrew required)"
             whisperStatusLabel.textColor = .systemRed
             installBrewButton.isHidden = false
@@ -173,18 +181,20 @@ class WhisperSetupWindowController: NSWindowController {
         }
 
         // ── model status ─────────────────────────────────────────────────────
-        let mp = t.resolvedModelPath
+        let mp = engine.resolvedModelPath
         if fm.fileExists(atPath: mp) {
             modelStatusLabel.stringValue = "✅ \(shorten(mp))"
             modelStatusLabel.textColor = .labelColor
-            downloadButton.isEnabled = false
-            downloadButton.title = "Model already downloaded"
         } else {
             modelStatusLabel.stringValue = "❌ Not found  (default: ~/.local/share/whisper-models/)"
             modelStatusLabel.textColor = .systemRed
-            downloadButton.isEnabled = true
-            downloadButton.title = "Download ggml-base.bin  (~150 MB)"
         }
+        let mediumPresent = fm.fileExists(atPath: (WhisperLocalEngine.defaultModelDir as NSString).appendingPathComponent("ggml-medium.bin"))
+        let basePresent = fm.fileExists(atPath: (WhisperLocalEngine.defaultModelDir as NSString).appendingPathComponent("ggml-base.bin"))
+        downloadMediumButton.isEnabled = !mediumPresent
+        downloadMediumButton.title = mediumPresent ? "medium ✓" : "medium  (~1.5 GB)"
+        downloadBaseButton.isEnabled = !basePresent
+        downloadBaseButton.title = basePresent ? "base ✓" : "base  (~150 MB)"
     }
 
     // MARK: - Actions
@@ -192,25 +202,17 @@ class WhisperSetupWindowController: NSWindowController {
     @objc private func installHomebrew() {
         let cmd = "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
         runInTerminal(cmd) {
-            // After Homebrew installs, poll until brew binary appears
-            self.pollUntil(
-                condition: { self.resolvedBrewPath() != nil },
-                then: { self.refresh() }
-            )
+            self.pollUntil(condition: { self.resolvedBrewPath() != nil }, then: { self.refresh() })
         }
     }
 
     @objc private func installWhisperCpp() {
         guard let brew = resolvedBrewPath() else { return }
         runInTerminal("\(brew) install whisper-cpp") {
-            self.pollUntil(
-                condition: { Transcriber.shared.resolvedWhisperPath != nil },
-                then: { self.refresh() }
-            )
+            self.pollUntil(condition: { self.engine.resolvedWhisperPath != nil }, then: { self.refresh() })
         }
     }
 
-    // Opens Terminal with `cmd`. Calls `onSuccess` if AppleScript succeeded; copies to clipboard otherwise.
     private func runInTerminal(_ cmd: String, onSuccess: @escaping () -> Void) {
         let script = """
         tell application "Terminal"
@@ -232,7 +234,6 @@ class WhisperSetupWindowController: NSWindowController {
         }
     }
 
-    /// Polls every 5 s (background) until `condition` is true, then calls `then` on main thread.
     private func pollUntil(condition: @escaping () -> Bool, then: @escaping () -> Void) {
         DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
             guard self != nil else { return }
@@ -268,24 +269,28 @@ class WhisperSetupWindowController: NSWindowController {
         }
     }
 
-    @objc private func downloadModel() {
-        downloadButton.isEnabled = false
+    @objc private func downloadMedium() { startDownload(named: "ggml-medium.bin") }
+    @objc private func downloadBase() { startDownload(named: "ggml-base.bin") }
+
+    private func startDownload(named modelName: String) {
+        downloadMediumButton.isEnabled = false
+        downloadBaseButton.isEnabled = false
         progressBar.doubleValue = 0
         progressBar.isHidden = false
         progressLabel.stringValue = "Connecting…"
         progressLabel.isHidden = false
 
-        Transcriber.shared.downloadBaseModel(
+        engine.downloadModel(
+            named: modelName,
             progress: { [weak self] p in
                 self?.progressBar.doubleValue = p
-                self?.progressLabel.stringValue = p > 0 ? "\(Int(p * 100))% downloaded" : "Connecting…"
+                self?.progressLabel.stringValue = p > 0 ? "\(modelName): \(Int(p * 100))% downloaded" : "Connecting…"
             },
             completion: { [weak self] error in
                 self?.progressBar.isHidden = true
                 if let error = error {
                     self?.progressLabel.stringValue = "❌ \(error.localizedDescription)"
                     self?.progressLabel.isHidden = false
-                    self?.downloadButton.isEnabled = true
                 } else {
                     self?.progressLabel.isHidden = true
                 }

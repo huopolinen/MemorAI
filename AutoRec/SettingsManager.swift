@@ -71,12 +71,60 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "captureInterval") }
     }
 
+    /// HEIF/JPEG compression quality for saved screenshots (0.1–1.0).
+    var screenshotQuality: Double {
+        get {
+            let val = defaults.double(forKey: "screenshotQuality")
+            return val > 0 ? val : 0.5
+        }
+        set { defaults.set(min(max(newValue, 0.1), 1.0), forKey: "screenshotQuality") }
+    }
+
+    /// dHash Hamming-distance threshold above which a new screenshot is considered
+    /// "changed enough" to save. Lower = more screenshots (more sensitive).
+    var screenshotChangeThreshold: Int {
+        get {
+            if defaults.object(forKey: "screenshotChangeThreshold") == nil { return 10 }
+            return defaults.integer(forKey: "screenshotChangeThreshold")
+        }
+        set { defaults.set(newValue, forKey: "screenshotChangeThreshold") }
+    }
+
     var excludedBundleIds: [String] {
         get { defaults.stringArray(forKey: "excludedBundleIds") ?? [] }
         set { defaults.set(newValue, forKey: "excludedBundleIds") }
     }
 
-    // MARK: - Whisper / Transcription
+    // MARK: - Transcription Engine
+
+    /// Selected transcription backend. See `TranscriptionEngineKind`.
+    var transcriptionEngine: String {
+        get { defaults.string(forKey: "transcriptionEngine") ?? "whisper_local" }
+        set { defaults.set(newValue, forKey: "transcriptionEngine") }
+    }
+
+    /// Groq API key (console.groq.com). Used by the Groq engine.
+    var groqApiKey: String {
+        get { defaults.string(forKey: "groqApiKey") ?? "" }
+        set { defaults.set(newValue, forKey: "groqApiKey") }
+    }
+
+    /// Google Gemini API key (aistudio.google.com). Used by the Gemini engine.
+    var geminiApiKey: String {
+        get { defaults.string(forKey: "geminiApiKey") ?? "" }
+        set { defaults.set(newValue, forKey: "geminiApiKey") }
+    }
+
+    /// Gemini model id. Editable so newer free models can be used without a rebuild.
+    var geminiModel: String {
+        get {
+            let m = defaults.string(forKey: "geminiModel") ?? ""
+            return m.isEmpty ? "gemini-2.5-flash" : m
+        }
+        set { defaults.set(newValue, forKey: "geminiModel") }
+    }
+
+    // MARK: - Whisper (local engine)
 
     /// Custom whisper-cli binary path override. Empty = auto-detect from common locations.
     var whisperPath: String {

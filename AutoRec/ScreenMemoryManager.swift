@@ -13,7 +13,6 @@ class ScreenMemoryManager {
     private var lastActiveAppBundleId: String = ""
     private var eventTap: CFMachPort?
 
-    private let hashThreshold = 10
     private let keyPressThreshold = 30
 
     private(set) var isRunning = false
@@ -69,6 +68,7 @@ class ScreenMemoryManager {
         let distance = capturer.hammingDistance(currentHash, lastSavedHash)
         let appChanged = !lastActiveAppBundleId.isEmpty && currentApp != lastActiveAppBundleId
         let keyThreshold = keyPressCount >= keyPressThreshold
+        let hashThreshold = settings.screenshotChangeThreshold
 
         lastActiveAppBundleId = currentApp
 
@@ -94,7 +94,7 @@ class ScreenMemoryManager {
         guard !FileManager.default.fileExists(atPath: imageURL.path) else { return }
 
         let meta = metadata.collect()
-        let savedURL = capturer.saveImage(image, to: imageURL)
+        let savedURL = capturer.saveImage(image, to: imageURL, quality: Float(settings.screenshotQuality))
         guard let savedURL = savedURL else { return }
 
         var baseRecord = meta
