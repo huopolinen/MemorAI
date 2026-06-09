@@ -18,7 +18,7 @@ enum HTTP {
     /// Like `sendSync`, but retries transient failures (network errors, HTTP 429,
     /// and 5xx — e.g. Gemini's "503 model overloaded") with exponential backoff.
     /// Safe to block: callers run on a background queue.
-    static func sendSyncRetrying(_ request: URLRequest, maxAttempts: Int = 5) -> (Data?, URLResponse?, Error?) {
+    static func sendSyncRetrying(_ request: URLRequest, maxAttempts: Int = 6) -> (Data?, URLResponse?, Error?) {
         var attempt = 0
         while true {
             attempt += 1
@@ -28,11 +28,31 @@ enum HTTP {
             if !retriable || attempt >= maxAttempts {
                 return (data, response, error)
             }
-            let backoff = min(pow(2.0, Double(attempt)), 30) // 2,4,8,16,30s
+            // Honour the server's suggested wait (e.g. Gemini 429 "Please retry in 39s"
+            // / RetryInfo retryDelay) — fixed backoff is too short for per-minute limits.
+            let serverDelay = data.flatMap { suggestedRetrySeconds(from: $0) }
+            let backoff = pow(2.0, Double(attempt)) // 2,4,8,16,32…
+            let wait = min(max(serverDelay ?? backoff, backoff), 65)
             let what = error != nil ? "network error" : "HTTP \(status)"
-            log("[HTTP] \(what) (attempt \(attempt)/\(maxAttempts)) — retry in \(Int(backoff))s")
-            Thread.sleep(forTimeInterval: backoff)
+            log("[HTTP] \(what) (attempt \(attempt)/\(maxAttempts)) — retry in \(Int(wait))s\(serverDelay != nil ? " (server hint)" : "")")
+            Thread.sleep(forTimeInterval: wait)
         }
+    }
+
+    /// Extract a retry delay (seconds) from a Google API error body, from either
+    /// `"retryDelay": "39s"` or `Please retry in 39.7s`. Adds a 1s safety margin.
+    private static func suggestedRetrySeconds(from data: Data) -> Double? {
+        guard let body = String(data: data, encoding: .utf8) else { return nil }
+        let patterns = [#"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"#, #"retry in (\d+(?:\.\d+)?)s"#]
+        for p in patterns {
+            if let re = try? NSRegularExpression(pattern: p),
+               let m = re.firstMatch(in: body, range: NSRange(body.startIndex..., in: body)),
+               let r = Range(m.range(at: 1), in: body),
+               let secs = Double(body[r]) {
+                return secs + 1
+            }
+        }
+        return nil
     }
 }
 

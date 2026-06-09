@@ -149,6 +149,16 @@ class Transcriber {
                 try? fullTranscript.write(to: txtPath, atomically: true, encoding: .utf8)
                 deduplicateTranscript(at: txtPath)
                 log("[Transcriber] ✅ Transcript saved: \(txtPath.lastPathComponent)")
+
+                // Polish raw ASR output (capitalization/punctuation/paragraphs) via the
+                // Groq LLM. Gemini already returns formatted text, so skip it there.
+                let groqKey = SettingsManager.shared.groqApiKey
+                if SettingsManager.shared.polishTranscripts, engine.kind != .gemini, !groqKey.isEmpty,
+                   let raw = try? String(contentsOf: txtPath, encoding: .utf8),
+                   let polished = TranscriptPolisher.polish(raw, apiKey: groqKey) {
+                    try? polished.write(to: txtPath, atomically: true, encoding: .utf8)
+                    log("[Transcriber] ✨ Transcript polished (punctuation/paragraphs)")
+                }
             } else {
                 log("[Transcriber] ❌ Engine produced no output")
             }
@@ -189,7 +199,20 @@ class Transcriber {
 
     /// Remove hallucination loops: exact duplicates and near-duplicate runs.
     private func deduplicateTranscript(at url: URL) {
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return }
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return }
+
+        // Pass 0: collapse in-line filler loops. LLM engines (Gemini) emit long
+        // runs of a backchannel token on filler-heavy audio, e.g.
+        // "Угу. Угу. Угу. Угу. …" all on one line — invisible to the line passes.
+        // Collapse 3+ consecutive repeats of the same short token to a single one.
+        var content = raw
+        if let re = try? NSRegularExpression(
+            pattern: #"(\b[\p{L}\p{N}]{1,15}[.,!?…]*)(?:\s+\1){2,}"#,
+            options: [.caseInsensitive]) {
+            content = re.stringByReplacingMatches(
+                in: content, range: NSRange(content.startIndex..., in: content), withTemplate: "$1")
+        }
+
         let lines = content.components(separatedBy: "\n")
 
         // Pass 1: collapse exact consecutive duplicates

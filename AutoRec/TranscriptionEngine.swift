@@ -9,8 +9,8 @@ enum TranscriptionEngineKind: String, CaseIterable {
     var displayName: String {
         switch self {
         case .whisperLocal: return "Локальный Whisper (офлайн)"
-        case .groq: return "Groq — Whisper large-v3 (быстро, бесплатно)"
-        case .gemini: return "Google Gemini (как NotebookLM, бесплатно)"
+        case .groq: return "Groq — Whisper large-v3 (быстро, надёжно, рекомендуется)"
+        case .gemini: return "Google Gemini (разметка по спикерам; free-tier нестабилен)"
         }
     }
 

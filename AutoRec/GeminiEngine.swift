@@ -35,6 +35,8 @@ final class GeminiEngine: TranscriptionEngine {
         Produce a clean, accurately punctuated transcript. When you can distinguish different voices, \
         label them as "Спикер 1:", "Спикер 2:", etc. on separate lines. \
         Do not summarize, comment, translate, or add anything that is not spoken. \
+        Never repeat a word or short filler (e.g. "угу", "ага", "да") more than twice in a row — \
+        transcribe backchannel sounds at most once; do not loop. \
         Output only the transcript text.
         """
 

@@ -124,6 +124,16 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "geminiModel") }
     }
 
+    /// Post-process raw ASR transcripts (Whisper/Groq) into punctuated, paragraphed
+    /// text via the Groq LLM. Requires a Groq key; no-op without one or for Gemini.
+    var polishTranscripts: Bool {
+        get {
+            if defaults.object(forKey: "polishTranscripts") == nil { return true }
+            return defaults.bool(forKey: "polishTranscripts")
+        }
+        set { defaults.set(newValue, forKey: "polishTranscripts") }
+    }
+
     // MARK: - Whisper (local engine)
 
     /// Custom whisper-cli binary path override. Empty = auto-detect from common locations.
