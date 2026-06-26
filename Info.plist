@@ -2,27 +2,27 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>
-    <string>MemorAI</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.local.memorai</string>
-    <key>CFBundleVersion</key>
-    <string>1.5.0</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.5.0</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleExecutable</key>
-    <string>MemorAI</string>
-    <key>CFBundleIconFile</key>
-    <string>MemorAI</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>MemorAI needs microphone access to record your voice during calls.</string>
-    <key>NSScreenCaptureUsageDescription</key>
-    <string>MemorAI needs screen capture access to record screen and system audio.</string>
-    <key>NSAccessibilityUsageDescription</key>
-    <string>MemorAI needs accessibility access to read window titles and browser URLs.</string>
+	<key>CFBundleExecutable</key>
+	<string>MemorAI</string>
+	<key>CFBundleIconFile</key>
+	<string>MemorAI</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.local.memorai</string>
+	<key>CFBundleName</key>
+	<string>MemorAI</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.5.1</string>
+	<key>CFBundleVersion</key>
+	<string>1.5.1</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>MemorAI needs accessibility access to read window titles and browser URLs.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>MemorAI needs microphone access to record your voice during calls.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>MemorAI needs screen capture access to record screen and system audio.</string>
 </dict>
 </plist>

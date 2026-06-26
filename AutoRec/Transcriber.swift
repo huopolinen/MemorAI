@@ -17,6 +17,26 @@ class Transcriber {
     private let minTrackDuration: Double = 1.0
     private let chunkSec: Double = 600 // 10 minutes per segment
 
+    /// Minimum speech (seconds) that must survive silence-trimming before we bother
+    /// transcribing. Near-silent recordings collapse below this and are skipped, so
+    /// Whisper never gets a chance to hallucinate subtitle credits onto dead air.
+    private let minSpeechDuration: Double = 1.0
+
+    /// ffmpeg filter that strips the dead air at the START and END of a recording —
+    /// the pre-connect ringing and post-goodbye silence where Whisper hallucinates
+    /// subtitle credits ("Продолжение следует…", "Субтитры сделал … DimaTorzok").
+    ///
+    /// Deliberately leading/trailing-only at a strict -50 dB (true digital silence):
+    /// the mic+system mix has almost no detectable internal silence (one channel
+    /// fills the other's gaps), and aggressive internal trimming risks clipping quiet
+    /// speech. Mid-call hallucinations on noisy pauses are left to the LLM polisher.
+    /// `areverse` flips the stream so the same head-trim also cleans the tail.
+    private let silenceFilter =
+        "silenceremove=start_periods=1:start_duration=0:start_threshold=-50dB:detection=peak,"
+        + "areverse,"
+        + "silenceremove=start_periods=1:start_duration=0:start_threshold=-50dB:detection=peak,"
+        + "areverse"
+
     /// Serial queue: cloud requests are sequential (rate limits) and local whisper
     /// jobs saturate CPU if run in parallel.
     private let transcriptionQueue = DispatchQueue(label: "com.local.memorai.transcribe", qos: .utility)
@@ -84,14 +104,14 @@ class Transcriber {
                     "-filter_complex",
                     "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[mic];"
                     + "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[sys];"
-                    + "[mic][sys]amix=inputs=2:duration=longest[a]",
+                    + "[mic][sys]amix=inputs=2:duration=longest,\(silenceFilter)[a]",
                     "-map", "[a]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
                     mergedWav.path,
                 ])
             } else {
                 let sourceURL = micOK ? micURL! : systemURL!
                 merge = Subprocess.run(ffmpegPath, args: [
-                    "-y", "-i", sourceURL.path,
+                    "-y", "-i", sourceURL.path, "-af", silenceFilter,
                     "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", mergedWav.path,
                 ])
             }
@@ -101,8 +121,19 @@ class Transcriber {
                 return
             }
 
-            // ── Segment → engine ────────────────────────────────────────────────
+            // ── Bail out on near-silent recordings ──────────────────────────────
+            // After silence-trimming, a recording that was just ringing/dead air
+            // collapses to ~0 s. Skip it: otherwise Whisper hallucinates subtitle
+            // credits onto the nothingness and we save a transcript of pure garbage.
             let duration = trackDuration(mergedWav)
+            guard duration >= minSpeechDuration else {
+                log("[Transcriber] No speech after silence-trim (\(String(format: "%.1f", duration))s) — skipping transcription")
+                try? FileManager.default.removeItem(at: mergedWav)
+                DispatchQueue.main.async { completion() }
+                return
+            }
+
+            // ── Segment → engine ────────────────────────────────────────────────
             let fmt = engine.inputFormat
             var fullTranscript = ""
 
@@ -201,11 +232,37 @@ class Transcriber {
     private func deduplicateTranscript(at url: URL) {
         guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return }
 
+        // Pass -1: strip known Whisper hallucinations. On silence/music, whisper-large
+        // emits boilerplate learned from YouTube subtitle data — subtitle credits and
+        // "to be continued" stings — that no amount of speech is actually present for.
+        // Deterministic and always-on (unlike the LLM polisher, which is optional and
+        // occasionally keeps a credit embedded mid-sentence), so it's the reliable floor.
+        var content = raw
+        let hallucinationPatterns = [
+            #"Продолжение следует[.…\s]*"#,
+            #"Субтитры (?:сделал|делал|создавал|подготовил)[^.!?\n]*?DimaTorzok[.!?]*"#,
+            #"Субтитры (?:сделал|делал|создавал|подготовил)[^.!?\n]{0,40}[.!?]"#,
+            #"(?:Редактор субтитров|Корректор)[^.!?\n]*[.!?]?"#,
+            #"DimaTorzok[.!?]*"#,
+            #"Спасибо за просмотр[.!…\s]*"#,
+            #"Подписывайтесь на канал[^.!?\n]*[.!?]?"#,
+        ]
+        for pat in hallucinationPatterns {
+            if let re = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive]) {
+                content = re.stringByReplacingMatches(
+                    in: content, range: NSRange(content.startIndex..., in: content), withTemplate: "")
+            }
+        }
+        // Tidy up the gaps left behind (doubled spaces, space-before-punctuation).
+        if let re = try? NSRegularExpression(pattern: #"[ \t]{2,}"#) {
+            content = re.stringByReplacingMatches(
+                in: content, range: NSRange(content.startIndex..., in: content), withTemplate: " ")
+        }
+
         // Pass 0: collapse in-line filler loops. LLM engines (Gemini) emit long
         // runs of a backchannel token on filler-heavy audio, e.g.
         // "Угу. Угу. Угу. Угу. …" all on one line — invisible to the line passes.
         // Collapse 3+ consecutive repeats of the same short token to a single one.
-        var content = raw
         if let re = try? NSRegularExpression(
             pattern: #"(\b[\p{L}\p{N}]{1,15}[.,!?…]*)(?:\s+\1){2,}"#,
             options: [.caseInsensitive]) {

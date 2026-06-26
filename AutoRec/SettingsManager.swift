@@ -49,7 +49,7 @@ class SettingsManager {
 
     var screenMemoryEnabled: Bool {
         get {
-            if defaults.object(forKey: "screenMemoryEnabled") == nil { return true }
+            if defaults.object(forKey: "screenMemoryEnabled") == nil { return false }
             return defaults.bool(forKey: "screenMemoryEnabled")
         }
         set { defaults.set(newValue, forKey: "screenMemoryEnabled") }
