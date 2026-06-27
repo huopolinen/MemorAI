@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import ObjCSupport
 
 /// Records microphone audio (what you say) into a separate .m4a file
 /// using AVAudioEngine + AVAudioFile.
@@ -53,60 +54,105 @@ class MicRecorder {
     private func startEngine() throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
 
-        guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
+        // Probe the input format ONLY to confirm a usable mic exists. We deliberately
+        // do NOT pass this format to installTap: the hardware input format can change
+        // between this read and the tap install (e.g. ScreenCaptureKit reconfiguring
+        // the input route when system-audio capture starts moments earlier). Passing a
+        // now-stale explicit format makes installTap raise an uncatchable NSException
+        // ("format.sampleRate == hwFormat.sampleRate"), which aborts the whole app.
+        let probeFormat = inputNode.outputFormat(forBus: 0)
+        guard probeFormat.sampleRate > 0, probeFormat.channelCount > 0 else {
             throw MicRecorderError.noMicAvailable
         }
 
-        // Match the file's encoding format to the input device's native rate and channel
-        // count. The tap delivers buffers in the device's native format (24/48/96 kHz, mono
-        // or stereo); writing them into a hardcoded 48 kHz mono AVAudioFile silently packed
-        // samples at the wrong rate and produced 2× speed audio (1.4.0/1.4.1) or empty files
-        // when manual AVAudioConverter conversion failed (1.4.2). Standard AAC accepts any
-        // sample rate and channel count, so writing in native format is reliable.
-        let nativeSampleRate = recordingFormat.sampleRate
-        let nativeChannels = recordingFormat.channelCount
+        // format: nil tells the engine to use the input bus's own format, resolved
+        // atomically at install time — no read/install race, no mismatch crash. The
+        // output file is created lazily from the first buffer's actual format so its
+        // sample rate / channel count always match the data we write.
+        //
+        // Even with nil, AVAudioEngine can still raise an uncatchable NSException for
+        // other invalid states (route changes, device disappearing mid-start). Wrap
+        // installTap + start in the ObjC shim so any such exception becomes a Swift
+        // error and degrades to a mic-less session instead of aborting the whole app
+        // (which would also lose the in-progress system-audio recording).
+        var startError: Error?
+        let nsError = objc_tryCatch {
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+                guard let self = self, self.isRecording, !self.isPaused else { return }
+                self.lastBufferTime = Date()
+                self.bufferCount &+= 1
 
-        if audioFile == nil {
-            let fileSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: nativeSampleRate,
-                AVNumberOfChannelsKey: nativeChannels,
-                AVEncoderBitRateKey: 32000 * Int(nativeChannels),
-            ]
-            self.audioFile = try AVAudioFile(
-                forWriting: outputURL,
-                settings: fileSettings,
-                commonFormat: .pcmFormatFloat32,
-                interleaved: false
-            )
-        }
+                if self.audioFile == nil {
+                    do {
+                        self.audioFile = try self.makeAudioFile(format: buffer.format)
+                    } catch {
+                        self.writeErrorCount += 1
+                        log("[MicRecorder] ❌ Failed to create audio file (\(self.writeErrorCount)/\(self.maxWriteErrors)): \(error.localizedDescription)")
+                        if self.writeErrorCount >= self.maxWriteErrors {
+                            log("[MicRecorder] ❌ Too many file errors — stopping mic recording")
+                            self.stop()
+                        }
+                        return
+                    }
+                }
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
-            guard let self = self, self.isRecording, !self.isPaused else { return }
-            self.lastBufferTime = Date()
-            self.bufferCount &+= 1
+                do {
+                    try self.audioFile?.write(from: buffer)
+                    self.writeErrorCount = 0
+                } catch {
+                    self.writeErrorCount += 1
+                    log("[MicRecorder] ❌ Write error (\(self.writeErrorCount)/\(self.maxWriteErrors)): \(error.localizedDescription)")
+                    if self.writeErrorCount >= self.maxWriteErrors {
+                        log("[MicRecorder] ❌ Too many write errors — stopping mic recording")
+                        self.stop()
+                    }
+                }
+                self.updateSilenceState(buffer)
+            }
 
             do {
-                try self.audioFile?.write(from: buffer)
-                self.writeErrorCount = 0
+                try engine.start()
             } catch {
-                self.writeErrorCount += 1
-                log("[MicRecorder] ❌ Write error (\(self.writeErrorCount)/\(self.maxWriteErrors)): \(error.localizedDescription)")
-                if self.writeErrorCount >= self.maxWriteErrors {
-                    log("[MicRecorder] ❌ Too many write errors — stopping mic recording")
-                    self.stop()
-                }
+                startError = error
             }
-            self.updateSilenceState(buffer)
         }
 
-        try engine.start()
+        if let nsError = nsError {
+            inputNode.removeTap(onBus: 0)
+            throw MicRecorderError.engineException(nsError.localizedDescription)
+        }
+        if let startError = startError {
+            inputNode.removeTap(onBus: 0)
+            throw startError
+        }
+
         self.engine = engine
         self.lastBufferTime = Date()
 
-        log("[MicRecorder] Engine started: \(Int(nativeSampleRate))Hz/\(nativeChannels)ch (native, no resampling)")
+        log("[MicRecorder] Engine started: probe \(Int(probeFormat.sampleRate))Hz/\(probeFormat.channelCount)ch (native, no resampling)")
+    }
+
+    /// Creates the AAC output file matched to the input device's native rate and channel
+    /// count. The tap delivers buffers in the device's native format (24/48/96 kHz, mono
+    /// or stereo); writing them into a hardcoded 48 kHz mono AVAudioFile silently packed
+    /// samples at the wrong rate and produced 2× speed audio (1.4.0/1.4.1) or empty files
+    /// when manual AVAudioConverter conversion failed (1.4.2). Standard AAC accepts any
+    /// sample rate and channel count, so writing in native format is reliable.
+    private func makeAudioFile(format: AVAudioFormat) throws -> AVAudioFile {
+        let nativeChannels = format.channelCount
+        let fileSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: nativeChannels,
+            AVEncoderBitRateKey: 32000 * Int(nativeChannels),
+        ]
+        return try AVAudioFile(
+            forWriting: outputURL,
+            settings: fileSettings,
+            commonFormat: .pcmFormatFloat32,
+            interleaved: false
+        )
     }
 
     private func installConfigChangeObserver() {
@@ -216,10 +262,12 @@ class MicRecorder {
 
 enum MicRecorderError: Error, LocalizedError {
     case noMicAvailable
+    case engineException(String)
 
     var errorDescription: String? {
         switch self {
         case .noMicAvailable: return "No microphone available or format invalid"
+        case .engineException(let reason): return "AVAudioEngine exception: \(reason)"
         }
     }
 }

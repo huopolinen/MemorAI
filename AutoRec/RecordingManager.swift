@@ -73,7 +73,15 @@ class RecordingManager {
                     self?.onMicSilenceChanged?(silent)
                 }
                 self.micRecorder = micRec
-                try micRec.start()
+                // A mic failure must not tear down the (already running) system-audio
+                // recording — degrade to a system-only session instead.
+                do {
+                    try micRec.start()
+                } catch {
+                    log("[RecordingManager] ⚠️ Mic failed to start — continuing system-only: \(error.localizedDescription)")
+                    self.micRecorder = nil
+                    self.currentMicURL = nil
+                }
 
                 setState(.recording)
                 log("[RecordingManager] All recorders running")
