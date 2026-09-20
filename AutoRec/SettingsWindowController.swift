@@ -50,7 +50,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private convenience init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 916),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 928),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false
         )
@@ -77,7 +77,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
-        y = 916 - 36
+        y = 928 - 36
 
         // ───────── Section: Запись звонков ─────────
         addHeader(content, "Запись звонков")
