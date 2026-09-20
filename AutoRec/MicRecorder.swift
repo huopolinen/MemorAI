@@ -236,6 +236,12 @@ class MicRecorder {
             throw MicRecorderError.noMicAvailable
         }
 
+        // Measured on this Mac (2026-09-20, macOS 26.2): the voice unit's first
+        // buffer lands about 2.0 s after the engine starts, against ~0.25 s for
+        // raw capture — so with the option on, the track's head is that much
+        // shorter. Anything lining this track up with the system one by wall
+        // clock has to know that; it is the main reason the option stays off.
+        //
         // With echo cancellation the tap needs ONE explicit mono client format:
         // VoiceProcessingIO is a duplex unit, not an input effect, and handed
         // the inherited multichannel route format it delivers digital silence
