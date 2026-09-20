@@ -81,8 +81,72 @@ cmd_status() {
         echo "Clipboard entries: 0"
     fi
 
-    local call_count=$(ls "$output"/call_*.m4a 2>/dev/null | wc -l | tr -d ' ')
+    # Tracks are .caf while they are the only copy of a call and .m4a once
+    # they have been archived after transcription — count both.
+    local call_count=$(ls "$output"/call_*_mic.m4a "$output"/call_*_mic.caf \
+                          "$output"/call_*_system.m4a "$output"/call_*_system.caf 2>/dev/null \
+                       | sed -E 's/_(mic|system)\.(m4a|caf)$//' | sort -u | wc -l | tr -d ' ')
     echo "Call recordings:  $call_count"
+
+    local pending
+    pending=$(ls "$output"/call_*.meta.json 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$pending" != "0" ]; then
+        echo ""
+        cmd_sessions
+    fi
+}
+
+# List recording sessions and what state each one is in, straight from the
+# per-session meta.json markers the app writes.
+cmd_sessions() {
+    local output
+    output=$(get_output_path)
+    python3 - "$output" << 'PYEOF'
+import glob, json, os, sys
+
+folder = sys.argv[1]
+rows = []
+for path in sorted(glob.glob(os.path.join(folder, "call_*.meta.json"))):
+    try:
+        with open(path) as handle:
+            meta = json.load(handle)
+    except Exception:
+        continue
+    tag = meta.get("tag") or os.path.basename(path)[: -len(".meta.json")]
+    status = meta.get("status", "?")
+    files = meta.get("files", {})
+    bytes_on_disk = 0
+    for name in files.values():
+        try:
+            bytes_on_disk += os.path.getsize(os.path.join(folder, name))
+        except OSError:
+            pass
+    transcript = os.path.join(folder, tag + "_transcript.txt")
+    has_text = os.path.exists(transcript) and os.path.getsize(transcript) > 0
+    note = []
+    if meta.get("recovered"):
+        note.append("recovered")
+    if meta.get("compressed"):
+        note.append("archived")
+    if meta.get("transcription_failed"):
+        note.append("no transcript")
+    rows.append((tag, status, bytes_on_disk / 1048576, has_text, ", ".join(note)))
+
+if not rows:
+    print("No session markers yet (recordings made before 1.6 have none).")
+    raise SystemExit
+
+print("=== Sessions ===")
+print(f"{'session':28s} {'status':12s} {'audio':>9s}  {'text':4s}  notes")
+for tag, status, mb, has_text, note in rows:
+    print(f"{tag:28s} {status:12s} {mb:8.1f}M  {'yes' if has_text else '—':4s}  {note}")
+
+stuck = [r for r in rows if r[1] == "recording"]
+if stuck:
+    print()
+    print("A session still marked 'recording' while the app is not running was")
+    print("interrupted; the next launch of MemorAI will recover it automatically.")
+PYEOF
 }
 
 cmd_screenshots() {
@@ -247,8 +311,53 @@ cmd_start() {
     fi
 }
 
+# Find the running app (the bundle's own binary, not this script and not some
+# unrelated process whose command line happens to mention MemorAI).
+app_pids() {
+    pgrep -f "MemorAI.app/Contents/MacOS/MemorAI" 2>/dev/null || pgrep -x "MemorAI" 2>/dev/null
+}
+
+any_alive() {
+    local pid
+    for pid in $1; do
+        kill -0 "$pid" 2>/dev/null && return 0
+    done
+    return 1
+}
+
 cmd_stop() {
-    pkill -f "MemorAI" 2>/dev/null && echo "MemorAI stopped" || echo "MemorAI is not running"
+    local pids
+    pids=$(app_pids)
+    if [ -z "$pids" ]; then
+        echo "MemorAI is not running"
+        return 0
+    fi
+
+    # SIGTERM, never SIGKILL first. The app catches it, stops the recorders and
+    # closes the audio tracks before exiting. A SIGKILL skips all of that: the
+    # recording itself still survives (it is uncompressed PCM on purpose), but
+    # it comes back as an interrupted session that has to be recovered on the
+    # next launch instead of simply being finished now.
+    echo "Stopping MemorAI…"
+    kill -TERM $pids 2>/dev/null
+
+    # The app gives itself 20 s to finish a recording before it gives up; wait
+    # a little longer than that before concluding it is genuinely wedged.
+    local waited=0
+    while [ $waited -lt 25 ]; do
+        sleep 1
+        waited=$((waited + 1))
+        if ! any_alive "$pids"; then
+            echo "MemorAI stopped cleanly (${waited}s)"
+            return 0
+        fi
+    done
+
+    echo "MemorAI did not exit in ${waited}s — forcing it."
+    echo "If a call was being recorded, it will be recovered on the next launch."
+    kill -9 $pids 2>/dev/null
+    sleep 1
+    any_alive "$pids" && echo "Still running — check Activity Monitor" || echo "MemorAI killed"
 }
 
 cmd_restart() {
@@ -269,6 +378,7 @@ Commands:
   stop                      Stop MemorAI
   restart                   Restart MemorAI
 
+  sessions                  List call sessions and their processing state
   screenshots [date]        List today's screenshots (or given YYYY-MM-DD)
   clipboard [count]         Show clipboard history (default: last 20)
   ocr [date] [count]        Show OCR text from screenshots
@@ -293,6 +403,7 @@ case "${1:-help}" in
     start)        cmd_start ;;
     stop)         cmd_stop ;;
     restart)      cmd_restart ;;
+    sessions)     cmd_sessions ;;
     screenshots)  cmd_screenshots "$2" ;;
     clipboard)    cmd_clipboard "$2" ;;
     ocr)          cmd_ocr "$2" "$3" ;;
