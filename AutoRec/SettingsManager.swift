@@ -99,7 +99,15 @@ class SettingsManager {
 
     /// Selected transcription backend. See `TranscriptionEngineKind`.
     var transcriptionEngine: String {
-        get { defaults.string(forKey: "transcriptionEngine") ?? "whisper_local" }
+        get {
+            if let stored = defaults.string(forKey: "transcriptionEngine") { return stored }
+            // Nobody has chosen yet. A Mac that already has whisper-cli and a
+            // model keeps using them — switching it to GigaAM would silently
+            // break a working install behind a 260 MB download. Everyone else
+            // starts on GigaAM: one click, no Homebrew, and a far better model
+            // for the Russian calls this app is mostly used for.
+            return WhisperLocalEngine.shared.isAvailable ? "whisper_local" : "gigaam"
+        }
         set { defaults.set(newValue, forKey: "transcriptionEngine") }
     }
 
@@ -146,6 +154,16 @@ class SettingsManager {
     var modelPath: String {
         get { defaults.string(forKey: "modelPath") ?? "" }
         set { defaults.set(newValue, forKey: "modelPath") }
+    }
+
+    // MARK: - GigaAM (local Russian engine)
+
+    /// Custom GigaAM GGUF path override. Empty = the managed copy in
+    /// ~/.local/share/gigaam-models/. Set it to use a different quantization
+    /// than the one the app downloads.
+    var gigaamModelPath: String {
+        get { defaults.string(forKey: "gigaamModelPath") ?? "" }
+        set { defaults.set(newValue, forKey: "gigaamModelPath") }
     }
 
     // MARK: - Helpers

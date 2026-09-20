@@ -2,14 +2,16 @@ import Foundation
 
 /// The selectable transcription backends.
 enum TranscriptionEngineKind: String, CaseIterable {
+    case gigaam = "gigaam"
     case whisperLocal = "whisper_local"
     case groq = "groq"
     case gemini = "gemini"
 
     var displayName: String {
         switch self {
-        case .whisperLocal: return "Локальный Whisper (офлайн)"
-        case .groq: return "Groq — Whisper large-v3 (быстро, надёжно, рекомендуется)"
+        case .gigaam: return "GigaAM v3 — русский, офлайн (рекомендуется для звонков на русском)"
+        case .whisperLocal: return "Локальный Whisper (офлайн, многоязычный)"
+        case .groq: return "Groq — Whisper large-v3 (быстро, надёжно, но в облаке)"
         case .gemini: return "Google Gemini (разметка по спикерам; free-tier нестабилен)"
         }
     }
@@ -17,6 +19,7 @@ enum TranscriptionEngineKind: String, CaseIterable {
     /// Short label for the status-bar menu.
     var shortName: String {
         switch self {
+        case .gigaam: return "GigaAM"
         case .whisperLocal: return "Whisper"
         case .groq: return "Groq"
         case .gemini: return "Gemini"
@@ -24,7 +27,12 @@ enum TranscriptionEngineKind: String, CaseIterable {
     }
 
     /// Whether this engine needs an internet connection / API key.
-    var isCloud: Bool { self != .whisperLocal }
+    var isCloud: Bool {
+        switch self {
+        case .gigaam, .whisperLocal: return false
+        case .groq, .gemini: return true
+        }
+    }
 }
 
 /// Audio container an engine wants each prepared segment in.
@@ -61,18 +69,28 @@ protocol TranscriptionEngine {
     /// Transcribe one audio file. Returns text, or nil on failure (already logged).
     /// `language` is an ISO-639-1 code ("ru", "en") or "auto".
     func transcribe(audioURL: URL, language: String) -> String?
+
+    /// Let go of anything expensive held between segments. Engines that load
+    /// model weights in-process (GigaAM) free them here; everything else is a
+    /// no-op. `Transcriber` calls it once a session's transcript is written.
+    func releaseResources()
+}
+
+extension TranscriptionEngine {
+    func releaseResources() {}
 }
 
 enum TranscriptionEngineFactory {
     /// Engine selected in Settings.
     static func current() -> TranscriptionEngine {
         let raw = SettingsManager.shared.transcriptionEngine
-        let kind = TranscriptionEngineKind(rawValue: raw) ?? .whisperLocal
+        let kind = TranscriptionEngineKind(rawValue: raw) ?? .gigaam
         return engine(for: kind)
     }
 
     static func engine(for kind: TranscriptionEngineKind) -> TranscriptionEngine {
         switch kind {
+        case .gigaam:       return GigaAMEngine.shared
         case .whisperLocal: return WhisperLocalEngine.shared
         case .groq:         return GroqEngine()
         case .gemini:       return GeminiEngine()
