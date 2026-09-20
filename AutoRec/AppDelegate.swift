@@ -9,12 +9,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = SettingsManager.shared
     private var whisperAlertShown = false
 
+    /// Signal sources are retained for the process's lifetime; a released
+    /// DispatchSource stops delivering.
+    private var signalSources: [DispatchSourceSignal] = []
+    /// Set once shutdown has begun, so a second Quit (or a second SIGTERM from
+    /// an impatient `memorai stop`) doesn't start the whole dance again.
+    private var isTerminating = false
+    private var hasRepliedToTermination = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
         setupMainMenu()
         requestPermissions()
         settings.ensureOutputDirectory()
+
+        // A crash leaves the audio tracks intact but nothing pointing at them:
+        // no stop, no transcription, just two orphaned files. Adopt those
+        // sessions before anything else touches the folder. Off the main thread
+        // because repairing headers and starting a transcription must not hold
+        // up the menu bar icon appearing.
+        let recordingsDir = URL(fileURLWithPath: settings.outputPath)
+        DispatchQueue.global(qos: .utility).async {
+            CrashRecovery.recoverPending(in: recordingsDir, queueTranscription: true)
+        }
 
         // --- Screen Memory (init before menu so clipboard history is available) ---
         screenMemory = ScreenMemoryManager()
@@ -56,9 +74,90 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self, selector: #selector(settingsChanged),
             name: .memorAISettingsChanged, object: nil)
 
+        installSignalHandlers()
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             self?.checkTranscriptionSetup()
         }
+    }
+
+    // MARK: - Shutdown
+
+    /// `memorai stop`, a `kill`, a logout — all arrive as signals, and without
+    /// a handler they end the process instantly, mid-call, with the track files
+    /// never closed. PCM means the audio survives that (see `AudioFormats`),
+    /// but surviving it and ending cleanly are not the same thing: a clean end
+    /// leaves files that need no repair and a marker that says so.
+    ///
+    /// DispatchSourceSignal rather than `signal()`: a C signal handler may only
+    /// call async-signal-safe functions, and stopping an AVAudioEngine is about
+    /// as far from that as it gets. The dispatch source turns the signal into
+    /// an ordinary callback on the main queue instead.
+    private func installSignalHandlers() {
+        for sig in [SIGTERM, SIGINT] {
+            // The default disposition kills us before the source ever runs.
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler {
+                log("[AppDelegate] Получен сигнал \(sig) — корректно завершаюсь")
+                // Route through the normal quit path so there is exactly one
+                // shutdown sequence to reason about.
+                NSApp.terminate(nil)
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
+    /// Hold termination open until the tracks are on disk.
+    ///
+    /// Quitting used to be a race: `quit()` asked the recorder to stop (which
+    /// does its work asynchronously) and then terminated the process
+    /// immediately, so the documented way to leave the app could truncate the
+    /// call you had just finished.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isTerminating { return .terminateLater }
+
+        screenMemory?.stop()
+
+        guard let manager = recordingManager, manager.isRecordingInProgress else {
+            // Transcription may still be running; it is interruptible by design
+            // — the audio is on disk and the next launch resumes the session
+            // from its marker.
+            if recordingManager?.isTranscribing == true {
+                log("[AppDelegate] Выхожу во время расшифровки — она продолжится при следующем запуске")
+            }
+            return .terminateNow
+        }
+
+        isTerminating = true
+        log("[AppDelegate] Идёт запись — не выхожу, пока дорожки не дописаны")
+
+        manager.finishForTermination { [weak self] in
+            self?.replyToTermination(finished: true)
+        }
+
+        // A hung recorder must not make the app unquittable. Closing two audio
+        // files takes well under a second (the stop path drains in-flight
+        // buffers for 300 ms, then rewrites a CAF header); 20 s is generous
+        // enough that only a genuinely stuck device hits it, and short enough
+        // that a user waiting on the Dock does not conclude the app has hung.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            self?.replyToTermination(finished: false)
+        }
+
+        return .terminateLater
+    }
+
+    private func replyToTermination(finished: Bool) {
+        guard !hasRepliedToTermination else { return }
+        hasRepliedToTermination = true
+        if finished {
+            log("[AppDelegate] Дорожки дописаны — выхожу")
+        } else {
+            log("[AppDelegate] ⚠️ Не дождался остановки записи за 20 с — выхожу. Запись на диске цела, при следующем запуске её подхватит восстановление.")
+        }
+        NSApp.reply(toApplicationShouldTerminate: true)
     }
 
     /// Re-sync live behaviour after the Settings window changes something.
@@ -455,9 +554,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: settings.outputPath))
     }
 
+    /// Stopping the recording and stopping screen memory both happen in
+    /// `applicationShouldTerminate`, which is also where a signal ends up — one
+    /// shutdown path, whether you chose Quit or something killed us politely.
     @objc private func quit() {
-        screenMemory.stop()
-        recordingManager.stopRecording()
         NSApp.terminate(nil)
     }
 

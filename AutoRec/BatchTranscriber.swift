@@ -21,16 +21,26 @@ enum BatchTranscriber {
             exit(1)
         }
 
+        // Sessions a crash left behind look like any other orphaned pair of
+        // files from here, so give them their meta.json back first. We pass
+        // queueTranscription: false — the loop below is about to do that job,
+        // and doing it twice would run the engine twice on the same audio.
+        CrashRecovery.recoverPending(in: dir, queueTranscription: false)
+
         let fm = FileManager.default
         let files = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
 
-        // Group audio files into sessions by their timestamp tag.
+        // Group audio files into sessions by their timestamp tag. A track is
+        // .caf while it is still the only copy of the call and .m4a once it has
+        // been archived, and old recordings only ever had .m4a — so both count.
+        let trackSuffixes = ["mic", "system"].flatMap { role in
+            [AudioFormats.trackExtension, AudioFormats.archiveExtension].map { "_\(role).\($0)" }
+        }
         var tags = Set<String>()
-        for f in files where f.hasPrefix("call_") && (f.hasSuffix("_mic.m4a") || f.hasSuffix("_system.m4a")) {
+        for f in files where f.hasPrefix("call_") {
+            guard let suffix = trackSuffixes.first(where: { f.hasSuffix($0) }) else { continue }
             if let d = dateFilter, !f.contains(d) { continue }
-            let tag = f.replacingOccurrences(of: "_mic.m4a", with: "")
-                       .replacingOccurrences(of: "_system.m4a", with: "")
-            tags.insert(tag)
+            tags.insert(String(f.dropLast(suffix.count)))
         }
 
         let sessions = tags.sorted()
@@ -51,10 +61,8 @@ enum BatchTranscriber {
                 }
                 if force { try? fm.removeItem(at: transcript) }
 
-                let micURL = dir.appendingPathComponent("\(tag)_mic.m4a")
-                let sysURL = dir.appendingPathComponent("\(tag)_system.m4a")
-                let mic = fm.fileExists(atPath: micURL.path) ? micURL : nil
-                let sys = fm.fileExists(atPath: sysURL.path) ? sysURL : nil
+                let mic = SessionMeta.trackURL(tag: tag, role: "mic", in: dir)
+                let sys = SessionMeta.trackURL(tag: tag, role: "system", in: dir)
 
                 print("[\(i+1)/\(sessions.count)] \(tag) — transcribing…")
                 let sem = DispatchSemaphore(value: 0)
@@ -64,6 +72,9 @@ enum BatchTranscriber {
                 if fm.fileExists(atPath: transcript.path) {
                     let size = ((try? fm.attributesOfItem(atPath: transcript.path))?[.size] as? Int) ?? 0
                     print("    ✅ saved \(transcript.lastPathComponent) (\(size) bytes)")
+                    // The transcript exists, so the uncompressed original has
+                    // done its job and can become an archive.
+                    TrackCompressor.settleAfterTranscript(tag: tag, in: dir)
                     done += 1
                 } else {
                     print("    ⚠️ no transcript produced (too short or engine error — see log)")
