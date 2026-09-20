@@ -39,6 +39,21 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "autoTranscribe") }
     }
 
+    /// Apple's echo cancellation (voice processing) on the mic track.
+    ///
+    /// Off by default, and that is not timidity: enabling it switches the
+    /// microphone into Apple's duplex call mode, which can duck or break up
+    /// what the *other* side hears — recording a call must never degrade the
+    /// call itself. On, the mic track stops recording whatever the speakers are
+    /// playing, which is worth it for people on speakers rather than headphones.
+    var micVoiceProcessing: Bool {
+        get {
+            if defaults.object(forKey: "micVoiceProcessing") == nil { return false }
+            return defaults.bool(forKey: "micVoiceProcessing")
+        }
+        set { defaults.set(newValue, forKey: "micVoiceProcessing") }
+    }
+
     /// Whisper language code: "ru", "en", "auto", etc. Default "ru".
     var whisperLanguage: String {
         get { defaults.string(forKey: "whisperLanguage") ?? "ru" }
