@@ -57,6 +57,15 @@ final class WhisperLocalEngine: TranscriptionEngine {
     }
 
     func transcribe(audioURL: URL, language: String) -> String? {
+        transcribeDetailed(audioURL: audioURL, language: language)?.text
+    }
+
+    /// whisper.cpp knows exactly when it heard each phrase; `-oj` writes it out
+    /// next to the text. We ask for both files: the JSON carries the timings
+    /// speaker labels are built on, and the .txt is the fallback if a future
+    /// whisper.cpp changes the JSON shape under us — losing the labels is
+    /// acceptable, losing the transcript is not.
+    func transcribeDetailed(audioURL: URL, language: String) -> TranscriptionResult? {
         guard let whisperExec = resolvedWhisperPath else {
             log("[WhisperLocal] whisper-cli not found")
             return nil
@@ -68,18 +77,49 @@ final class WhisperLocalEngine: TranscriptionEngine {
         let result = Subprocess.run(whisperExec, args: [
             "-m", modelFile, "-l", lang,
             "-et", "2.2", "-lpt", "-0.5",
-            "-otxt", "-of", outBase.path,
+            "-otxt", "-oj", "-of", outBase.path,
             audioURL.path,
         ])
 
         let txtURL = outBase.appendingPathExtension("txt")
-        defer { try? FileManager.default.removeItem(at: txtURL) }
+        let jsonURL = outBase.appendingPathExtension("json")
+        defer {
+            try? FileManager.default.removeItem(at: txtURL)
+            try? FileManager.default.removeItem(at: jsonURL)
+        }
 
         guard result.ok else {
             log("[WhisperLocal] ❌ whisper-cli failed (exit \(result.exitCode)): \(result.stderr.suffix(400))")
             return nil
         }
-        return try? String(contentsOf: txtURL, encoding: .utf8)
+
+        if let segments = Self.segments(fromJSONAt: jsonURL), !segments.isEmpty {
+            let text = segments.map(\.text).joined(separator: "\n")
+            return TranscriptionResult(text: text, segments: segments)
+        }
+        log("[WhisperLocal] ⚠️ JSON без сегментов — беру текст, метки говорящих в этом куске не будет")
+        guard let text = try? String(contentsOf: txtURL, encoding: .utf8) else { return nil }
+        return TranscriptionResult(text: text, segments: nil)
+    }
+
+    /// `transcription[].offsets` is milliseconds from the start of the file
+    /// handed to whisper — see the `-oj` output format.
+    private static func segments(fromJSONAt url: URL) -> [TranscriptSegment]? {
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = root["transcription"] as? [[String: Any]]
+        else { return nil }
+
+        return items.compactMap { item -> TranscriptSegment? in
+            guard let offsets = item["offsets"] as? [String: Any],
+                  let from = (offsets["from"] as? NSNumber)?.doubleValue,
+                  let to = (offsets["to"] as? NSNumber)?.doubleValue,
+                  let text = item["text"] as? String
+            else { return nil }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return TranscriptSegment(start: from / 1000, end: to / 1000, text: trimmed)
+        }
     }
 
     // MARK: - Model download

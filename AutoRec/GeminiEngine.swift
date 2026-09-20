@@ -3,6 +3,13 @@ import Foundation
 /// Transcription via Google Gemini (the technology behind NotebookLM).
 /// Unlike raw ASR, Gemini is prompted to return a clean, well-punctuated,
 /// speaker-attributed transcript — matching the "NotebookLM / Notion AI" feel.
+///
+/// It returns prose and nothing else: no timings, so it uses the protocol's
+/// default `transcribeDetailed` and this engine's transcripts carry no
+/// "Я"/"Собеседник" labels from `SpeakerAttribution`. Its own "Спикер 1/2"
+/// guesses come from the words, not from the tracks, and it cannot know which
+/// speaker is the owner of the machine. Choose Whisper or Groq when it matters
+/// who said what.
 final class GeminiEngine: TranscriptionEngine {
     let kind: TranscriptionEngineKind = .gemini
     let inputFormat: EngineAudioFormat = .flac

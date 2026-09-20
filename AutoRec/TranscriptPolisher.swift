@@ -13,7 +13,12 @@ enum TranscriptPolisher {
     private static let wordsPerChunk = 2200 // keep input+output well within token limits
 
     /// Returns formatted text, or nil if polishing isn't possible/failed (caller keeps raw).
-    static func polish(_ text: String, apiKey: String) -> String? {
+    ///
+    /// `speakerLabels` says the text is already split into "Я: …" / "Собеседник: …"
+    /// turns. Those labels cost real work to recover — they come from comparing
+    /// the two audio tracks, not from the words — so the model is told to leave
+    /// them alone and the result is checked before it is accepted.
+    static func polish(_ text: String, apiKey: String, speakerLabels: Bool = false) -> String? {
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -22,17 +27,46 @@ enum TranscriptPolisher {
         let chunks = splitByWords(trimmed, perChunk: wordsPerChunk)
         var out: [String] = []
         for (i, chunk) in chunks.enumerated() {
-            guard let formatted = formatChunk(chunk, key: key) else {
+            guard let formatted = formatChunk(chunk, key: key, speakerLabels: speakerLabels) else {
                 log("[Polisher] chunk \(i + 1)/\(chunks.count) failed — aborting, keeping raw")
                 return nil
             }
             out.append(formatted)
         }
+        let result = out.joined(separator: "\n\n")
+
+        // A polished transcript that lost its speaker labels is a downgrade, not
+        // an improvement: punctuation can be inferred by whoever reads it, "who
+        // said this" cannot. Losing a few labels to reflow is expected; losing
+        // most of them means the model rewrote the structure, and we keep the raw.
+        if speakerLabels {
+            let before = labelCount(trimmed)
+            let after = labelCount(result)
+            guard before == 0 || after * 2 >= before else {
+                log("[Polisher] ⚠️ полировка съела метки говорящих (\(before) → \(after)) — оставляю неполированный текст")
+                return nil
+            }
+        }
         log("[Polisher] formatted \(chunks.count) chunk(s)")
-        return out.joined(separator: "\n\n")
+        return result
     }
 
-    private static func formatChunk(_ chunk: String, key: String) -> String? {
+    /// Lines that start with a speaker label the attribution pass wrote.
+    private static func labelCount(_ text: String) -> Int {
+        text.components(separatedBy: "\n").filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.hasPrefix("Я:") || trimmed.hasPrefix("Я ")
+                || trimmed.hasPrefix("Собеседник:") || trimmed.hasPrefix("Собеседник ")
+        }.count
+    }
+
+    private static func formatChunk(_ chunk: String, key: String, speakerLabels: Bool) -> String? {
+        let labelRule = speakerLabels ? """
+        Текст уже разбит на реплики: каждый абзац начинается с метки говорящего \
+        («Я:», «Собеседник:», «Собеседник A:»). Эти метки ОБЯЗАТЕЛЬНО сохраняй \
+        дословно и в том же месте, не объединяй абзацы разных говорящих, не \
+        переставляй реплики и не добавляй новых меток.
+        """ : ""
         let system = """
         Ты редактор расшифровок речи. На вход — сырой текст распознавания (часто без \
         заглавных букв и знаков препинания). Твоя задача: расставить заглавные буквы, \
@@ -45,6 +79,7 @@ enum TranscriptPolisher {
         создавал …», «Редактор субтитров …», «DimaTorzok») и вставки на тишине \
         вроде «Продолжение следует», «Спасибо за просмотр», «Подписывайтесь на канал». \
         Их выкидывай целиком; реальные слова разговора не трогай. \
+        \(labelRule) \
         Верни ТОЛЬКО отредактированный текст, без преамбул.
         """
         let payload: [String: Any] = [
