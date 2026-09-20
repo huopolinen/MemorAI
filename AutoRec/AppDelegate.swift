@@ -171,25 +171,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !whisperAlertShown else { return }
         guard settings.autoTranscribe else { return }
         // Cloud engines are configured in Settings, not via this alert.
-        let kind = TranscriptionEngineKind(rawValue: settings.transcriptionEngine) ?? .whisperLocal
-        guard kind == .whisperLocal else { return }
-        let engine = WhisperLocalEngine.shared
-        guard !engine.isAvailable else { return }
-        whisperAlertShown = true
+        let kind = TranscriptionEngineKind(rawValue: settings.transcriptionEngine) ?? .gigaam
+        guard !kind.isCloud else { return }
 
         let alert = NSAlert()
         alert.addButton(withTitle: "Open Setup")
         alert.addButton(withTitle: "Dismiss")
-        if engine.resolvedWhisperPath == nil {
-            alert.messageText = "whisper-cpp not installed"
-            alert.informativeText = "Auto-transcription requires whisper-cpp.\n\nIn Setup you can install it automatically via Homebrew, or pick a free cloud engine (Groq / Gemini) in Settings."
-        } else {
-            alert.messageText = "Whisper model not found"
-            alert.informativeText = "whisper-cli is ready but no model file was found.\n\nIn Setup you can download a model in one click, or pick a free cloud engine in Settings."
+
+        switch kind {
+        case .gigaam:
+            guard !GigaAMEngine.shared.isAvailable else { return }
+            alert.messageText = "Модель GigaAM не скачана"
+            alert.informativeText = "Расшифровка на русском работает офлайн, но сначала нужно скачать модель (\(GigaAMModelStore.sizeLabel)). Один клик, Homebrew и ключи не нужны."
+        case .whisperLocal:
+            let engine = WhisperLocalEngine.shared
+            guard !engine.isAvailable else { return }
+            if engine.resolvedWhisperPath == nil {
+                alert.messageText = "whisper-cpp not installed"
+                alert.informativeText = "Auto-transcription requires whisper-cpp.\n\nIn Setup you can install it automatically via Homebrew, or switch to GigaAM (offline, Russian) or a cloud engine in Settings."
+            } else {
+                alert.messageText = "Whisper model not found"
+                alert.informativeText = "whisper-cli is ready but no model file was found.\n\nIn Setup you can download a model in one click, or pick another engine in Settings."
+            }
+        case .groq, .gemini:
+            return
         }
+
+        whisperAlertShown = true
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
-            WhisperSetupWindowController.shared.show()
+            if kind == .gigaam { GigaAMSetupWindowController.shared.show() }
+            else { WhisperSetupWindowController.shared.show() }
         }
     }
 

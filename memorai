@@ -9,6 +9,14 @@ else
     APP_PATH="$(dirname "$0")/MemorAI.app"
 fi
 
+# Local-engine model caches. Must match GigaAMModelStore.defaultModelDir and
+# WhisperLocalEngine.defaultModelDir in the Swift sources.
+GIGAAM_MODEL_DIR="$HOME/.local/share/gigaam-models"
+GIGAAM_MODEL="$GIGAAM_MODEL_DIR/gigaam-v3-e2e-ctc-Q8_0.gguf"
+GIGAAM_MODEL_URL="https://huggingface.co/handy-computer/gigaam-v3-e2e-ctc-gguf/resolve/075dff81f843cf23d22b4ce943ffdc4dd8650cd7/gigaam-v3-e2e-ctc-Q8_0.gguf?download=true"
+GIGAAM_MODEL_SHA256="9ccce4750dc813a493d96ca15ee251712bedec15ac9a02fa3d2bd732f08ae5eb"
+WHISPER_MODEL_DIR="$HOME/.local/share/whisper-models"
+
 get_output_path() {
     local path
     path=$(defaults read "$BUNDLE_ID" outputPath 2>/dev/null)
@@ -48,6 +56,29 @@ cmd_status() {
     echo "Auto-detect Calls:$([ "$auto_detect" = "1" ] && echo " ON" || echo " OFF")"
     echo "Record Screen:    $([ "$record_screen" = "1" ] && echo ON || echo OFF)"
     echo "Auto-transcribe:  $([ "$auto_transcribe" = "1" ] && echo ON || echo OFF)"
+    echo ""
+
+    echo "--- Transcription ---"
+    local engine=$(defaults read "$BUNDLE_ID" transcriptionEngine 2>/dev/null)
+    local language=$(defaults read "$BUNDLE_ID" whisperLanguage 2>/dev/null || echo "ru")
+    if [ -z "$engine" ]; then
+        # Mirrors SettingsManager: with no explicit choice, an existing whisper
+        # setup keeps working and everyone else starts on GigaAM.
+        if [ -n "$(ls "$WHISPER_MODEL_DIR"/ggml-*.bin 2>/dev/null)" ]; then
+            engine="whisper_local (по умолчанию)"
+        else
+            engine="gigaam (по умолчанию)"
+        fi
+    fi
+    echo "Engine:           $engine"
+    echo "Language:         $language"
+    if [ -f "$GIGAAM_MODEL" ]; then
+        echo "GigaAM model:     installed ($(du -h "$GIGAAM_MODEL" | cut -f1))"
+    else
+        echo "GigaAM model:     NOT downloaded  (memorai model download)"
+    fi
+    local whisper_models=$(ls "$WHISPER_MODEL_DIR"/ggml-*.bin 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')
+    echo "Whisper models:   ${whisper_models:-none}"
     echo ""
 
     # Excluded apps
@@ -250,9 +281,28 @@ cmd_set() {
             defaults write "$BUNDLE_ID" autoDetect -bool "$value"
             echo "Auto-detect Calls: $value"
             ;;
+        engine)
+            case "$value" in
+                gigaam|whisper_local|groq|gemini) ;;
+                *)
+                    echo "Unknown engine: $value"
+                    echo "Available: gigaam, whisper_local, groq, gemini"
+                    return 1
+                    ;;
+            esac
+            defaults write "$BUNDLE_ID" transcriptionEngine -string "$value"
+            echo "Transcription engine: $value"
+            if [ "$value" = "gigaam" ] && [ ! -f "$GIGAAM_MODEL" ]; then
+                echo "⚠️  Модель GigaAM не скачана — запусти: memorai model download"
+            fi
+            ;;
+        language)
+            defaults write "$BUNDLE_ID" whisperLanguage -string "$value"
+            echo "Language: $value"
+            ;;
         *)
             echo "Unknown setting: $key"
-            echo "Available: screen-memory, clipboard, interval, auto-detect"
+            echo "Available: screen-memory, clipboard, interval, auto-detect, engine, language"
             return 1
             ;;
     esac
@@ -298,6 +348,53 @@ cmd_exclude() {
             ;;
         *)
             echo "Usage: memorai exclude <add|remove|list> [bundle-id]"
+            ;;
+    esac
+}
+
+cmd_model() {
+    local action="${1:-status}"
+
+    case "$action" in
+        status)
+            if [ -f "$GIGAAM_MODEL" ]; then
+                echo "GigaAM: installed  $GIGAAM_MODEL ($(du -h "$GIGAAM_MODEL" | cut -f1))"
+            else
+                echo "GigaAM: not downloaded  ($GIGAAM_MODEL)"
+            fi
+            echo "Whisper: $(ls "$WHISPER_MODEL_DIR"/ggml-*.bin 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+            ;;
+        download)
+            if [ -f "$GIGAAM_MODEL" ]; then
+                echo "Already downloaded: $GIGAAM_MODEL"
+                return 0
+            fi
+            mkdir -p "$GIGAAM_MODEL_DIR"
+            echo "Downloading GigaAM v3 (~260 MB)…"
+            # Into .partial, verified, then renamed — same contract as the app,
+            # so a killed download never leaves a file the app would trust.
+            curl -L --fail --progress-bar -o "$GIGAAM_MODEL.partial" "$GIGAAM_MODEL_URL" || {
+                rm -f "$GIGAAM_MODEL.partial"
+                echo "❌ Download failed"
+                return 1
+            }
+            local got
+            got=$(shasum -a 256 "$GIGAAM_MODEL.partial" | cut -d' ' -f1)
+            if [ "$got" != "$GIGAAM_MODEL_SHA256" ]; then
+                rm -f "$GIGAAM_MODEL.partial"
+                echo "❌ Checksum mismatch ($got) — file corrupted, try again"
+                return 1
+            fi
+            mv "$GIGAAM_MODEL.partial" "$GIGAAM_MODEL"
+            echo "✅ GigaAM model ready: $GIGAAM_MODEL"
+            ;;
+        remove)
+            rm -f "$GIGAAM_MODEL"
+            echo "Removed $GIGAAM_MODEL"
+            ;;
+        *)
+            echo "Usage: memorai model <status|download|remove>"
+            return 1
             ;;
     esac
 }
@@ -383,11 +480,16 @@ Commands:
   clipboard [count]         Show clipboard history (default: last 20)
   ocr [date] [count]        Show OCR text from screenshots
 
+  model <status|download|remove>
+                            Manage the local GigaAM model (~260 MB)
+
   set <key> <value>         Change a setting
     screen-memory true/false
     clipboard true/false
     interval <seconds>
     auto-detect true/false
+    engine gigaam|whisper_local|groq|gemini
+    language ru|en|auto
 
   exclude add <bundle-id>   Add app to exclusion list
   exclude remove <bundle-id>  Remove app from exclusion list
@@ -407,6 +509,7 @@ case "${1:-help}" in
     screenshots)  cmd_screenshots "$2" ;;
     clipboard)    cmd_clipboard "$2" ;;
     ocr)          cmd_ocr "$2" "$3" ;;
+    model)        cmd_model "$2" ;;
     set)          cmd_set "$2" "$3" ;;
     exclude)      cmd_exclude "$2" "$3" ;;
     help|--help|-h) cmd_help ;;

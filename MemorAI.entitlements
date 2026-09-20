@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Single source of truth for both bundle.sh (local builds) and
+         release-notarized.sh (distribution). They used to carry separate
+         heredocs that had already drifted — the local build was missing
+         screen-capture — which meant a locally tested app was not the app
+         that shipped. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.device.screen-capture</key>
+    <true/>
+</dict>
+</plist>

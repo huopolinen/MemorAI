@@ -176,6 +176,10 @@ class Transcriber {
 
             try? FileManager.default.removeItem(at: mergedWav)
 
+            // All segments are done, so any in-process model weights (GigaAM's
+            // ~260 MB) can go back to the OS until the next call.
+            engine.releaseResources()
+
             if !fullTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 try? fullTranscript.write(to: txtPath, atomically: true, encoding: .utf8)
                 deduplicateTranscript(at: txtPath)
@@ -237,6 +241,9 @@ class Transcriber {
         // "to be continued" stings — that no amount of speech is actually present for.
         // Deterministic and always-on (unlike the LLM polisher, which is optional and
         // occasionally keeps a credit embedded mid-sentence), so it's the reliable floor.
+        // Kept engine-agnostic on purpose: GigaAM has no such training data to
+        // hallucinate from, but Whisper (local and via Groq) is still selectable,
+        // and running these substitutions over clean text costs nothing.
         var content = raw
         let hallucinationPatterns = [
             #"Продолжение следует[.…\s]*"#,
