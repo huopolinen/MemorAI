@@ -9,7 +9,11 @@ import Foundation
 /// rewording. Best-effort — on any failure the original text is kept.
 enum TranscriptPolisher {
     private static let endpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
-    private static let model = "llama-3.3-70b-versatile"
+    /// Groq retires models without notice, and this one's death was invisible:
+    /// every polish returned HTTP 404, the caller fell back to the raw text as
+    /// designed, and nothing looked broken from the outside. If polishing ever
+    /// seems to stop happening, check this name against Groq's model list first.
+    private static let model = "openai/gpt-oss-120b"
     private static let wordsPerChunk = 2200 // keep input+output well within token limits
 
     /// Returns formatted text, or nil if polishing isn't possible/failed (caller keeps raw).

@@ -5,9 +5,11 @@ import Darwin
 
 /// Detects active calls by watching which *other* processes hold the microphone input.
 ///
-/// Uses the per-process CoreAudio API (macOS 14.2+): `kAudioHardwarePropertyProcessObjectList`
-/// + `kAudioProcessPropertyIsRunningInput` + `kAudioProcessPropertyPID`. We filter out our
-/// own PID, so our MicRecorder's AVAudioEngine does not mask call-end.
+/// The question "who is holding the microphone" is asked of `AudioProcesses`, which is the
+/// one place in the app that talks to the per-process CoreAudio API — the Core Audio tap and
+/// `MicRoute` ask it the same thing for their own reasons, and all three must never disagree
+/// about which app the call is in. Our own PID is filtered out there, so our MicRecorder's
+/// AVAudioEngine does not mask call-end.
 ///
 /// Silence-based signals (system audio, mic RMS) are kept as informational callbacks but no
 /// longer drive call-end decisions — a call app releases its own mic when the meeting ends,
@@ -33,15 +35,13 @@ class CallDetector {
     private(set) var micSilent = false
     private(set) var systemAudioAvailable = true
 
-    private static let ourPID: pid_t = getpid()
-
     func startMonitoring() {
         stopMonitoring()
         timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.checkStatus()
         }
         timer?.tolerance = 0.5
-        log("[CallDetector] Started monitoring (poll every \(pollInterval)s, our pid=\(Self.ourPID))")
+        log("[CallDetector] Started monitoring (poll every \(pollInterval)s, our pid=\(getpid()))")
     }
 
     func stopMonitoring() {
@@ -96,7 +96,7 @@ class CallDetector {
     // MARK: - Poll
 
     private func checkStatus() {
-        let foreign = Self.foreignMicHolders()
+        let foreign = AudioProcesses.micHolders()
         let inCall = !foreign.isEmpty
 
         if inCall {
@@ -122,108 +122,5 @@ class CallDetector {
             log("[CallDetector] \(recordingMode ? "No other process holds mic" : "Mic released") — call ended")
             onCallEnded?()
         }
-    }
-
-    // MARK: - Per-process CoreAudio query
-
-    /// A process other than us that is holding the microphone right now.
-    ///
-    /// Exposed (rather than being a detail of call detection) because the mic
-    /// track needs the same answer for a different question: the device the
-    /// call app is listening to is the microphone the person is talking into,
-    /// and that is the one worth recording — see `MicRoute`.
-    struct ForeignMicHolder {
-        let pid: pid_t
-        /// Core Audio's per-process object, which is what
-        /// `kAudioProcessPropertyDevices` is asked of.
-        let object: AudioObjectID
-        var label: String {
-            if let app = NSRunningApplication(processIdentifier: pid),
-               let name = app.localizedName ?? app.bundleIdentifier {
-                return "\(name) (pid \(pid))"
-            }
-            return "pid \(pid)"
-        }
-    }
-
-    /// Enumerates audio process objects and returns ones (other than us) capturing mic input.
-    static func foreignMicHolders() -> [ForeignMicHolder] {
-        var listAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyProcessObjectList,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(
-            AudioObjectID(kAudioObjectSystemObject), &listAddress, 0, nil, &size
-        ) == noErr, size > 0 else {
-            return []
-        }
-
-        let count = Int(size) / MemoryLayout<AudioObjectID>.size
-        var objects = [AudioObjectID](repeating: 0, count: count)
-        guard AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &listAddress, 0, nil, &size, &objects
-        ) == noErr else {
-            return []
-        }
-
-        var holders: [ForeignMicHolder] = []
-        for obj in objects {
-            guard processIsRunningInput(obj) else { continue }
-            let pid = processPID(obj)
-            guard pid > 0, pid != ourPID else { continue }
-            guard isUserFacingProcess(pid: pid) else { continue }
-            holders.append(ForeignMicHolder(pid: pid, object: obj))
-        }
-        return holders
-    }
-
-    /// Returns false for system daemons (corespeechd, assistantd, coreaudiod, etc.) that
-    /// hold the mic for background OS features like Siri / dictation and should never be
-    /// treated as call activity. Anything shipping from /System or /usr/libexec qualifies.
-    private static func isUserFacingProcess(pid: pid_t) -> Bool {
-        guard let path = executablePath(pid: pid) else { return false }
-        if path.hasPrefix("/System/") { return false }
-        if path.hasPrefix("/usr/libexec/") { return false }
-        if path.hasPrefix("/usr/sbin/") { return false }
-        if path.hasPrefix("/usr/bin/") { return false }
-        return true
-    }
-
-    private static func executablePath(pid: pid_t) -> String? {
-        // PROC_PIDPATHINFO_MAXSIZE = 4 * MAXPATHLEN, plenty for any real path
-        var buffer = [CChar](repeating: 0, count: 4 * 1024)
-        let bytes = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-        guard bytes > 0 else { return nil }
-        return String(cString: buffer)
-    }
-
-    private static func processIsRunningInput(_ object: AudioObjectID) -> Bool {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioProcessPropertyIsRunningInput,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        var value: UInt32 = 0
-        guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr else {
-            return false
-        }
-        return value != 0
-    }
-
-    private static func processPID(_ object: AudioObjectID) -> pid_t {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioProcessPropertyPID,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(MemoryLayout<pid_t>.size)
-        var pid: pid_t = 0
-        guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &pid) == noErr else {
-            return 0
-        }
-        return pid
     }
 }

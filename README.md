@@ -112,6 +112,10 @@ Settings → Расшифровка → GigaAM → *Настроить / ска�
 The model is pinned to one Hugging Face revision and verified by size and
 SHA-256 before it is used.
 
+GigaAM is a CTC model, so it times every token it emits; MemorAI assembles
+those into phrases, which is what the "Я" / "Собеседник" labels are built on.
+Switching to it does not cost you the labels.
+
 ### Whisper — multilingual, offline
 
 ```bash
@@ -128,6 +132,26 @@ Russian, GigaAM beats it at a fifth of the size.
 
 Paste an API key in Settings. Audio leaves the machine; everything else here
 does not.
+
+Groq returns segment times, so it keeps the speaker labels. **Gemini does not**
+— it answers in prose with no timings at all, and a transcript made with it has
+no "Я" / "Собеседник" labels and no `_transcript.json`.
+
+A Groq key is also what the optional transcript polisher uses (punctuation,
+capitalization and paragraphs, wording untouched); it runs after any engine
+except Gemini and is told to keep the speaker labels it finds.
+
+## Who said what
+
+When both tracks exist and the engine gives timings, each call gets two files:
+
+- `call_<ts>_transcript.txt` — readable, one paragraph per speaker turn
+- `call_<ts>_transcript.json` — the engine's exact wording, times, the side
+  (`me` / `them`) and how confident the attribution was
+
+Attribution is loudness-based: whichever of the two tracks was loud under a
+phrase is the one who said it. Talking over each other lowers the confidence on
+those segments rather than dropping them.
 
 ## License
 

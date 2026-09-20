@@ -13,11 +13,15 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.5.2</string>
+	<string>1.6.0</string>
 	<key>CFBundleVersion</key>
-	<string>1.5.2</string>
+	<string>1.6.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>MemorAI needs to control Terminal to run the optional whisper.cpp install command for you.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>MemorAI needs audio capture access to record the other side of your calls.</string>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>MemorAI needs accessibility access to read window titles and browser URLs.</string>
 	<key>NSMicrophoneUsageDescription</key>

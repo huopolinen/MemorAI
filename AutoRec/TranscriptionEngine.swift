@@ -12,7 +12,7 @@ enum TranscriptionEngineKind: String, CaseIterable {
         case .gigaam: return "GigaAM v3 — русский, офлайн (рекомендуется для звонков на русском)"
         case .whisperLocal: return "Локальный Whisper (офлайн, многоязычный)"
         case .groq: return "Groq — Whisper large-v3 (быстро, надёжно, но в облаке)"
-        case .gemini: return "Google Gemini (разметка по спикерам; free-tier нестабилен)"
+        case .gemini: return "Google Gemini (без меток говорящих — нет таймкодов; free-tier нестабилен)"
         }
     }
 
@@ -80,6 +80,13 @@ protocol TranscriptionEngine {
     /// segment it emits, and Gemini answers in prose and has none.
     func transcribeDetailed(audioURL: URL, language: String) -> TranscriptionResult?
 
+    /// Whether this engine can produce the timings speaker labels are built on.
+    /// A protocol requirement rather than a plain extension property because
+    /// GigaAM only learns the answer when it loads the model, and the caller
+    /// holds engines as `TranscriptionEngine` — an extension-only property
+    /// would dispatch statically and never see that answer.
+    var providesTimestamps: Bool { get }
+
     /// Let go of anything expensive held between segments. Engines that load
     /// model weights in-process (GigaAM) free them here; everything else is a
     /// no-op. `Transcriber` calls it once a session's transcript is written.
@@ -95,8 +102,7 @@ extension TranscriptionEngine {
         return TranscriptionResult(text: text, segments: nil)
     }
 
-    /// Whether this engine can produce the timings speaker labels are built on.
-    /// Used only to explain the outcome in the log and in Settings.
+    /// Everything except Gemini, which answers in prose and has no timings.
     var providesTimestamps: Bool { kind != .gemini }
 
     func releaseResources() {}

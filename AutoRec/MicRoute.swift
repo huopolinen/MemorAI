@@ -98,11 +98,12 @@ enum MicRoute {
     /// one, which leaves the engine to its own default — the behaviour of every
     /// version before this one.
     static func preferred() -> Device? {
-        // CallDetector already enumerates the processes holding the mic, with
-        // system daemons (Siri, dictation) and our own engine filtered out —
-        // exactly the set this question needs, so it is asked there.
+        // `AudioProcesses` already enumerates the processes holding the mic,
+        // with system daemons (Siri, dictation) and our own engine filtered
+        // out — exactly the set this question needs, and the same set call
+        // detection and the Core Audio tap work from.
         var seen = Set<AudioObjectID>()
-        let callAppInputs = CallDetector.foreignMicHolders()
+        let callAppInputs = AudioProcesses.micHolders()
             .flatMap { inputDevices(of: $0.object) }
             // A process doing duplex I/O lists its *output* device here too
             // (anything with echo cancellation on, including us), and a speaker

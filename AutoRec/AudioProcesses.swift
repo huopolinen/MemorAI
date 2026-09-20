@@ -12,12 +12,10 @@ import Foundation
 /// the same property list, and the tap's scope is seeded from the mic holders
 /// precisely so the two can never disagree about which app the call is in.
 ///
-/// MERGE NOTE: `CallDetector` still carries its own copy of the enumeration,
-/// and the `feat/mic-route-following` branch is turning that copy into a
-/// public static method that also returns the CoreAudio object id. When the
-/// two branches meet, `objectList()` below should call that method instead of
-/// re-querying the HAL — this file was deliberately left self-contained rather
-/// than rewriting a file another branch is editing.
+/// `MicRoute` asks a third question of the same list — which *device* the call
+/// app is listening to — so this is the only enumeration of audio processes in
+/// the app; `CallDetector` used to carry its own copy and now calls
+/// `micHolders()`.
 ///
 /// подход из amanu (MIT, gsamat/amanu): Sources/amanu/Audio/AudioProcesses.swift
 enum AudioProcesses {

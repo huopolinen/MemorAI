@@ -7,6 +7,9 @@
          heredocs that had already drifted — the local build was missing
          screen-capture — which meant a locally tested app was not the app
          that shipped. -->
+    <!-- The Core Audio process tap has no signing entitlement of its own: it
+         is a runtime permission (Info.plist's NSAudioCaptureUsageDescription
+         plus the system prompt), so nothing is added here for it. -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
     <key>com.apple.security.device.screen-capture</key>

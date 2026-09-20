@@ -50,7 +50,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private convenience init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 882),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 916),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false
         )
@@ -77,7 +77,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
-        y = 882 - 36
+        y = 916 - 36
 
         // ───────── Section: Запись звонков ─────────
         addHeader(content, "Запись звонков")
@@ -104,6 +104,8 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         addHeader(content, "Расшифровка речи")
         autoTranscribeCheck = addCheckbox(content, "Авто-расшифровка после записи")
         enginePopup = addPopupRow(content, "Движок", items: engineKinds.map { $0.displayName })
+        addHint(content, "Метки «Я» / «Собеседник» в транскрипте ставятся по таймкодам движка: "
+            + "GigaAM, Whisper и Groq их дают, Gemini — нет, и с ним расшифровка выйдет без меток.")
         languagePopup = addPopupRow(content, "Язык", items: ["Русский", "English", "Авто-определение"])
 
         // Groq row
