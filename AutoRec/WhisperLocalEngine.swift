@@ -84,9 +84,14 @@ final class WhisperLocalEngine: TranscriptionEngine {
 
     // MARK: - Model download
 
-    private var activeDownloadDelegate: DownloadDelegate?
+    /// Keeps the in-flight transfer alive; the shared downloader owns the rest.
+    private var activeDownload: ModelDownloader.Handle?
 
     /// Download a whisper ggml model into `defaultModelDir`.
+    ///
+    /// No integrity manifest here on purpose: these come from the `main` ref of
+    /// the whisper.cpp repo, so a pinned size/hash would start failing the day
+    /// upstream republishes a model. GigaAM, pinned to one revision, does check.
     func downloadModel(named modelName: String,
                        progress: @escaping (Double) -> Void,
                        completion: @escaping (Error?) -> Void) {
@@ -96,54 +101,13 @@ final class WhisperLocalEngine: TranscriptionEngine {
                                userInfo: [NSLocalizedDescriptionKey: "Bad model URL"]))
             return
         }
-
-        let destDir = Self.defaultModelDir
-        let destPath = (destDir as NSString).appendingPathComponent(modelName)
-        try? FileManager.default.createDirectory(atPath: destDir, withIntermediateDirectories: true)
-
-        let delegate = DownloadDelegate(destPath: destPath, progress: progress, completion: { [weak self] err in
-            self?.activeDownloadDelegate = nil
-            completion(err)
-        })
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: .main)
-        activeDownloadDelegate = delegate
-        session.downloadTask(with: url).resume()
-    }
-
-    private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
-        private let destPath: String
-        private let progressHandler: (Double) -> Void
-        private let completionHandler: (Error?) -> Void
-
-        init(destPath: String, progress: @escaping (Double) -> Void, completion: @escaping (Error?) -> Void) {
-            self.destPath = destPath
-            self.progressHandler = progress
-            self.completionHandler = completion
-        }
-
-        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                        didWriteData _: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite total: Int64) {
-            let fraction = total > 0 ? Double(totalBytesWritten) / Double(total) : 0
-            DispatchQueue.main.async { self.progressHandler(fraction) }
-        }
-
-        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-            do {
-                let dest = URL(fileURLWithPath: destPath)
-                if FileManager.default.fileExists(atPath: destPath) {
-                    try FileManager.default.removeItem(at: dest)
-                }
-                try FileManager.default.moveItem(at: location, to: dest)
-                DispatchQueue.main.async { self.completionHandler(nil) }
-            } catch {
-                DispatchQueue.main.async { self.completionHandler(error) }
-            }
-        }
-
-        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-            if let error = error {
-                DispatchQueue.main.async { self.completionHandler(error) }
-            }
-        }
+        let destPath = (Self.defaultModelDir as NSString).appendingPathComponent(modelName)
+        activeDownload = ModelDownloader.download(
+            from: url, to: destPath,
+            progress: progress,
+            completion: { [weak self] error in
+                self?.activeDownload = nil
+                completion(error)
+            })
     }
 }
