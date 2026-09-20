@@ -16,6 +16,10 @@ class RecordingManager {
     var onTranscriptionDone: (() -> Void)?
 
     private var systemAudioRecorder: SystemAudioRecorder?
+    /// Core Audio tap, when that path is selected. Boxed as `Any?` because the
+    /// tap API needs macOS 14.4 while this class is compiled for 14.0 — every
+    /// use goes through the availability-checked accessor below.
+    private var tapRecorderBox: Any?
     private var micRecorder: MicRecorder?
     private let settings = SettingsManager.shared
 
@@ -26,6 +30,12 @@ class RecordingManager {
     /// "call_<timestamp>" — names every file of the session and its meta.json.
     private var currentTag: String?
     private var currentDir: URL?
+
+    @available(macOS 14.4, *)
+    private var tapRecorder: CoreAudioTapRecorder? {
+        get { tapRecorderBox as? CoreAudioTapRecorder }
+        set { tapRecorderBox = newValue }
+    }
 
     private(set) var isTranscribing = false
 
@@ -68,23 +78,91 @@ class RecordingManager {
         if let vidURL { files["screen"] = vidURL.lastPathComponent }
         SessionMeta.begin(tag: tag, in: baseDir, trigger: source, files: files)
 
+        // Two ways to capture the far end (SettingsManager.systemAudioSource):
+        //
+        //  • .screenCapture — one SCStream writes both the system track and
+        //    the video, as it always has.
+        //  • .coreAudioTap  — a Core Audio tap writes the system track, and
+        //    SCStream, if screen recording is on at all, is created with no
+        //    audio URL (and therefore `capturesAudio = false`).
+        //
+        // So exactly one writer ever opens `_system.caf`, and the far end is
+        // never captured twice. The muxer downstream doesn't care which path
+        // produced the track — it reads the same file name either way.
+        let wantsTap = settings.systemAudioSource == .coreAudioTap
+
         Task {
             do {
-                let sysRec = SystemAudioRecorder(audioURL: sysURL, videoURL: vidURL)
-                // Wire up silence / availability / error signals
-                sysRec.onSilenceChanged = { [weak self] silent in
-                    self?.onSilenceChanged?(silent)
+                var tapStarted = false
+                if wantsTap {
+                    if #available(macOS 14.4, *) {
+                        let tap = CoreAudioTapRecorder(
+                            audioURL: sysURL, callAppOnly: settings.tapCallAppOnly)
+                        tap.onSilenceChanged = { [weak self] silent in
+                            self?.onSilenceChanged?(silent)
+                        }
+                        tap.onSystemAudioUnavailable = { [weak self] in
+                            self?.onSystemAudioUnavailable?()
+                        }
+                        tap.onStreamError = { [weak self] error in
+                            guard let self = self, self.state == .recording || self.state == .starting else { return }
+                            log("[RecordingManager] Core Audio tap error — stopping session: \(error.localizedDescription)")
+                            self.stopRecording(source: "stream-error")
+                        }
+                        do {
+                            try tap.start()
+                            self.tapRecorder = tap
+                            tapStarted = true
+                        } catch {
+                            // A tap that won't start must not cost the call:
+                            // fall back to the path that has always worked.
+                            log("[RecordingManager] ⚠️ Core Audio tap не стартовал (\(error.localizedDescription)) — пишу системный звук через запись экрана")
+                        }
+                    } else {
+                        log("[RecordingManager] ⚠️ Core Audio tap требует macOS 14.4 — пишу системный звук через запись экрана")
+                    }
                 }
-                sysRec.onSystemAudioUnavailable = { [weak self] in
-                    self?.onSystemAudioUnavailable?()
+
+                // SCStream is still needed for the video, and for the system
+                // track whenever the tap is not the one writing it.
+                if !tapStarted || vidURL != nil {
+                    let sysRec = SystemAudioRecorder(
+                        audioURL: tapStarted ? nil : sysURL, videoURL: vidURL)
+                    if tapStarted {
+                        // Video-only stream: its death must not take the
+                        // (separate, still healthy) audio capture with it.
+                        sysRec.onStreamError = { error in
+                            log("[RecordingManager] ⚠️ Видео экрана остановилось: \(error.localizedDescription) — звук продолжает писаться")
+                        }
+                    } else {
+                        // Wire up silence / availability / error signals
+                        sysRec.onSilenceChanged = { [weak self] silent in
+                            self?.onSilenceChanged?(silent)
+                        }
+                        sysRec.onSystemAudioUnavailable = { [weak self] in
+                            self?.onSystemAudioUnavailable?()
+                        }
+                        sysRec.onStreamError = { [weak self] error in
+                            guard let self = self, self.state == .recording || self.state == .starting else { return }
+                            log("[RecordingManager] SCStream error — stopping session: \(error.localizedDescription)")
+                            self.stopRecording(source: "stream-error")
+                        }
+                    }
+                    self.systemAudioRecorder = sysRec
+                    do {
+                        try await sysRec.start()
+                    } catch {
+                        // Only reachable with the tap already running, because
+                        // otherwise this throw is the session failing to start.
+                        guard tapStarted else { throw error }
+                        log("[RecordingManager] ⚠️ Видео экрана не стартовало — продолжаю без него: \(error.localizedDescription)")
+                        self.systemAudioRecorder = nil
+                        self.currentScreenURL = nil
+                        var remaining = files
+                        remaining.removeValue(forKey: "screen")
+                        SessionMeta.update(tag: tag, in: baseDir, with: ["files": remaining])
+                    }
                 }
-                sysRec.onStreamError = { [weak self] error in
-                    guard let self = self, self.state == .recording || self.state == .starting else { return }
-                    log("[RecordingManager] SCStream error — stopping session: \(error.localizedDescription)")
-                    self.stopRecording(source: "stream-error")
-                }
-                self.systemAudioRecorder = sysRec
-                try await sysRec.start()
 
                 let micRec = MicRecorder(outputURL: micURL)
                 micRec.onSilenceChanged = { [weak self] silent in
@@ -110,6 +188,7 @@ class RecordingManager {
             } catch {
                 log("[RecordingManager] ❌ Failed to start: \(error)")
                 await systemAudioRecorder?.stop()
+                if #available(macOS 14.4, *) { tapRecorder?.stop(); tapRecorder = nil }
                 micRecorder?.stop()
                 systemAudioRecorder = nil
                 micRecorder = nil
@@ -128,6 +207,7 @@ class RecordingManager {
     func pauseRecording() {
         guard state == .recording else { return }
         systemAudioRecorder?.isPaused = true
+        if #available(macOS 14.4, *) { tapRecorder?.isPaused = true }
         micRecorder?.isPaused = true
         setState(.paused)
         log("[RecordingManager] Paused")
@@ -136,6 +216,7 @@ class RecordingManager {
     func resumeRecording() {
         guard state == .paused else { return }
         systemAudioRecorder?.isPaused = false
+        if #available(macOS 14.4, *) { tapRecorder?.isPaused = false }
         micRecorder?.isPaused = false
         setState(.recording)
         log("[RecordingManager] Resumed")
@@ -201,6 +282,9 @@ class RecordingManager {
 
         micRecorder?.stop()
         await systemAudioRecorder?.stop()
+        // Stopping the tap destroys its private aggregate device: leaving one
+        // behind would sit in the user's audio stack until the next reboot.
+        if #available(macOS 14.4, *) { tapRecorder?.stop(); tapRecorder = nil }
         micRecorder = nil
         systemAudioRecorder = nil
         setState(.idle)

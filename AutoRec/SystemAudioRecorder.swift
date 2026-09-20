@@ -6,6 +6,14 @@ import CoreVideo
 /// Captures system audio and optionally screen via a single SCStream.
 /// System audio → .caf file, screen → .mp4 file (if enabled).
 ///
+/// Either half can be switched off. With `audioURL == nil` the stream is
+/// created with `capturesAudio = false` and writes video only — that is the
+/// shape used when the system track comes from `CoreAudioTapRecorder`
+/// instead. The two paths then share nothing: SCStream never opens the
+/// `_system.caf` the tap is writing, and the tap never sees a video frame, so
+/// there is no way for the same audio to be recorded twice or for two writers
+/// to meet on one file.
+///
 /// The audio track is written as uncompressed PCM through AVAudioFile rather
 /// than as AAC through AVAssetWriter, and that is deliberate: an AVAssetWriter
 /// .m4a is unreadable until `finishWriting` completes, so a process killed
@@ -22,7 +30,8 @@ class SystemAudioRecorder: NSObject {
     /// Set when the audio track has given up. Kept separate from `isRecording`
     /// so a dead audio file doesn't also silently end the screen recording.
     private var audioFailed = false
-    private let audioURL: URL
+    /// nil = video-only stream (system audio is being captured elsewhere).
+    private let audioURL: URL?
 
     // Video writer (optional)
     private var videoWriter: AVAssetWriter?
@@ -63,8 +72,10 @@ class SystemAudioRecorder: NSObject {
     private let warmupTimeout: TimeInterval = 30.0
     private var warmupTimer: DispatchSourceTimer?
 
-    /// If videoURL is nil, only audio is captured (no screen).
-    init(audioURL: URL, videoURL: URL?) {
+    /// If videoURL is nil, only audio is captured (no screen); if audioURL is
+    /// nil, only screen (no system audio). Both nil is a stream with nothing
+    /// to do — the caller is expected not to create one.
+    init(audioURL: URL?, videoURL: URL?) {
         self.audioURL = audioURL
         self.videoURL = videoURL
         super.init()
@@ -78,7 +89,7 @@ class SystemAudioRecorder: NSObject {
         silenceStart = nil
         isSilent = false
 
-        try? FileManager.default.removeItem(at: audioURL)
+        if let audioURL { try? FileManager.default.removeItem(at: audioURL) }
         if let videoURL { try? FileManager.default.removeItem(at: videoURL) }
 
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -96,6 +107,7 @@ class SystemAudioRecorder: NSObject {
         // Use 1x display size (not Retina) — sufficient for call recordings
         // and much more reliable for H.264 encoding
         let recordScreen = videoURL != nil
+        let recordAudio = audioURL != nil
         // Make sure dimensions are even for H.264
         let capW = display.width & ~1
         let capH = display.height & ~1
@@ -104,7 +116,7 @@ class SystemAudioRecorder: NSObject {
 
         // --- Single SCStream for both audio and video ---
         let config = SCStreamConfiguration()
-        config.capturesAudio = true
+        config.capturesAudio = recordAudio
         config.excludesCurrentProcessAudio = true
         config.sampleRate = 48000
         config.channelCount = 2
@@ -129,9 +141,11 @@ class SystemAudioRecorder: NSObject {
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
 
-        let aQueue = DispatchQueue(label: "autorec.audio", qos: .userInitiated)
-        self.audioQueue = aQueue
-        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: aQueue)
+        if recordAudio {
+            let aQueue = DispatchQueue(label: "autorec.audio", qos: .userInitiated)
+            self.audioQueue = aQueue
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: aQueue)
+        }
 
         if recordScreen {
             let vQueue = DispatchQueue(label: "autorec.video", qos: .userInitiated)
@@ -143,9 +157,11 @@ class SystemAudioRecorder: NSObject {
         try await stream.startCapture()
         isRecording = true
 
-        startWarmupTimer()
+        // No audio track, nothing to time out on: the mic-only signal belongs
+        // to whoever is actually writing the system track.
+        if recordAudio { startWarmupTimer() }
 
-        log("[SystemAudioRecorder] Started — audio: \(audioURL.lastPathComponent), video: \(videoURL?.lastPathComponent ?? "off")")
+        log("[SystemAudioRecorder] Started — audio: \(audioURL?.lastPathComponent ?? "off"), video: \(videoURL?.lastPathComponent ?? "off")")
     }
 
     /// Arm a one-shot timer: if no non-silent audio buffer arrives in `warmupTimeout` seconds,
@@ -267,7 +283,7 @@ extension SystemAudioRecorder: SCStreamOutput {
 
         switch type {
         case .audio:
-            guard !audioFailed, let pcm = pcmBuffer(from: sampleBuffer) else { return }
+            guard !audioFailed, let audioURL, let pcm = pcmBuffer(from: sampleBuffer) else { return }
 
             if audioFile == nil {
                 do {
