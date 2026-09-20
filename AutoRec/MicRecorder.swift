@@ -77,6 +77,26 @@ class MicRecorder {
     /// notice a restart storm.
     private var restartTimes: [Date] = []
 
+    // MARK: Echo cancellation (off by default — see SettingsManager.micVoiceProcessing)
+    //
+    // Read once, at start: a setting toggled mid-call must not change the shape
+    // of a track that is already being written. Whatever the session started
+    // with is what every restart re-applies — restarting raw "because the call
+    // app cancels echo anyway" is wrong (the call app cancels what *it* sends,
+    // we tap the device), and amanu paid for it with the far end at −3 dB on
+    // its own track for 35 minutes.
+    private var voiceProcessingRequested = false
+    private var voiceProcessingActive = false
+    /// Set once the voice route has proved it delivers nothing but digital
+    /// zeros; after that the session stays raw rather than retrying it.
+    private var voiceProcessingGaveSilence = false
+    // Touched from the audio thread only, reset on main before the engine that
+    // will use them is started, so no buffer can be in flight over the reset.
+    private var voiceLivenessSettled = true
+    private var voiceLivenessFrames = 0
+    private var voiceLivenessTarget = 0
+    private var voiceLivenessPeak: Float = 0
+
     /// How often the ticker runs. It answers two questions at different rates:
     /// a stalled engine every tick, the route every third one.
     private let tickInterval: TimeInterval = 5.0
@@ -121,8 +141,9 @@ class MicRecorder {
 
         isRecording = true
         withLock { sessionEnded = false }
+        voiceProcessingRequested = SettingsManager.shared.micVoiceProcessing
         do {
-            try attach()
+            try attach(voiceProcessing: voiceProcessingRequested)
         } catch {
             isRecording = false
             throw error
@@ -165,10 +186,36 @@ class MicRecorder {
 
     /// Build the engine, install the tap and start capturing. Called at start
     /// and again on every restart; the file, if one is already open, is kept.
-    private func attach() throws {
+    private func attach(voiceProcessing: Bool) throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let device = MicRoute.preferred()
+
+        // Echo cancellation, when the session asked for it. A route the voice
+        // unit refuses is not fatal — raw capture is what we would have done
+        // anyway — so a refusal is logged and the attach carries on.
+        var voice = false
+        if voiceProcessing {
+            var vpError: Error?
+            let raised = objc_tryCatch {
+                do {
+                    try inputNode.setVoiceProcessingEnabled(true)
+                    // The live voice unit makes macOS treat this like a call
+                    // and duck everything else: the meeting itself would get
+                    // quieter the moment recording starts.
+                    inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                        AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                            enableAdvancedDucking: false, duckingLevel: .min)
+                    voice = true
+                } catch {
+                    vpError = error
+                }
+            }
+            if let reason = raised?.localizedDescription ?? vpError?.localizedDescription {
+                log("[MicRecorder] ⚠️ Echo cancellation unavailable (\(reason)) — recording raw")
+                voice = false
+            }
+        }
 
         // Probe the input format ONLY to confirm a usable mic exists. We deliberately
         // do NOT pass this format to installTap: the hardware input format can change
@@ -179,6 +226,23 @@ class MicRecorder {
         let probeFormat = inputNode.outputFormat(forBus: 0)
         guard probeFormat.sampleRate > 0, probeFormat.channelCount > 0 else {
             throw MicRecorderError.noMicAvailable
+        }
+
+        // With echo cancellation the tap needs ONE explicit mono client format:
+        // VoiceProcessingIO is a duplex unit, not an input effect, and handed
+        // the inherited multichannel route format it delivers digital silence
+        // (amanu rca-001). Mid-session the rate is the open file's rather than
+        // the new device's — the file's format is the one thing that cannot
+        // change. Raw capture keeps format: nil, see below.
+        var tapFormat: AVAudioFormat?
+        if voice {
+            let rate = withLock { fileFormat }?.sampleRate ?? probeFormat.sampleRate
+            guard let mono = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false
+            ) else {
+                throw MicRecorderError.noMicAvailable
+            }
+            tapFormat = mono
         }
 
         // format: nil tells the engine to use the input bus's own format, resolved
@@ -193,7 +257,14 @@ class MicRecorder {
         // (which would also lose the in-progress system-audio recording).
         var startError: Error?
         let nsError = objc_tryCatch {
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+            if let tapFormat = tapFormat {
+                // Complete the duplex graph: VoiceProcessingIO must render to
+                // an output device or the input side never produces audio. The
+                // mixer has no sources — nothing is monitored or played — the
+                // connection exists only to give the unit an output path.
+                engine.connect(engine.mainMixerNode, to: engine.outputNode, format: tapFormat)
+            }
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
                 self?.handle(buffer)
             }
 
@@ -216,9 +287,12 @@ class MicRecorder {
         self.engine = engine
         self.attachedAt = Date()
         self.boundDevice = device?.id
+        self.voiceProcessingActive = inputNode.isVoiceProcessingEnabled
+        armVoiceLiveness(format: tapFormat)
 
-        log("[MicRecorder] Engine started on \(device?.name ?? "default input"): "
-            + "probe \(Int(probeFormat.sampleRate))Hz/\(probeFormat.channelCount)ch (native, no resampling)")
+        let shape = tapFormat.map { "\(Int($0.sampleRate))Hz/1ch (echo-cancelled)" }
+            ?? "\(Int(probeFormat.sampleRate))Hz/\(probeFormat.channelCount)ch (native, no resampling)"
+        log("[MicRecorder] Engine started on \(device?.name ?? "default input"): \(shape)")
     }
 
     private func teardownEngine() {
@@ -241,6 +315,8 @@ class MicRecorder {
             lastBufferAt = now
             bufferCount &+= 1
         }
+
+        if !voiceLivenessSettled { checkVoiceLiveness(buffer) }
 
         guard !isPaused else {
             // Pause already drops wall-clock time from the track, so a route
@@ -401,6 +477,45 @@ class MicRecorder {
         // stop() tears down the engine this callback is running on, so it can
         // only be done from somewhere that is not the audio thread.
         DispatchQueue.main.async { [weak self] in self?.stop() }
+    }
+
+    // MARK: - Echo cancellation liveness
+
+    /// Arm the "is this route actually producing audio?" check for a voice
+    /// attach, and disarm it for a raw one (raw capture has never had this
+    /// failure mode).
+    private func armVoiceLiveness(format: AVAudioFormat?) {
+        guard let format = format else {
+            voiceLivenessSettled = true
+            return
+        }
+        // Mid-session the window is longer, because there the check has a false
+        // positive it does not have at startup: the noise suppressor emits true
+        // digital zeros in a quiet room, in runs approaching a second.
+        let seconds: Double = withLock { audioFile } == nil ? 1 : 3
+        voiceLivenessTarget = Int(format.sampleRate * seconds)
+        voiceLivenessFrames = 0
+        voiceLivenessPeak = 0
+        voiceLivenessSettled = false
+    }
+
+    /// Some device pairs take the voice unit, report it enabled, and deliver
+    /// callbacks full of digital zeros. Nothing reports that — the only signal
+    /// is the samples themselves, so the first second of them is measured.
+    private func checkVoiceLiveness(_ buffer: AVAudioPCMBuffer) {
+        let frames = Int(buffer.frameLength)
+        if let data = buffer.floatChannelData?[0] {
+            for i in 0..<frames { voiceLivenessPeak = max(voiceLivenessPeak, abs(data[i])) }
+        }
+        voiceLivenessFrames += frames
+        guard voiceLivenessFrames >= voiceLivenessTarget else { return }
+        voiceLivenessSettled = true
+        guard voiceLivenessPeak == 0 else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isRecording, self.voiceProcessingActive else { return }
+            self.voiceProcessingGaveSilence = true
+            self.restartCapture(reason: "echo cancellation delivered digital silence")
+        }
     }
 
     // MARK: - Route following
@@ -573,20 +688,41 @@ class MicRecorder {
 
         let now = Date()
         restartTimes = restartTimes.filter { now.timeIntervalSince($0) < stormWindow }
-        if restartTimes.count >= stormLimit {
+        // A track with an echo on it is a bad recording; a track rebuilt every
+        // two seconds is no recording. Past the limit the session goes raw.
+        let storming = restartTimes.count >= stormLimit
+        if storming {
             log("[MicRecorder] ⚠️ \(restartTimes.count) restarts in \(Int(stormWindow))s — "
-                + "the route is unstable")
+                + "the route is unstable, capturing raw")
         }
         restartTimes.append(now)
 
+        // The rebuild keeps whatever the session started with. Dropping echo
+        // cancellation here is silent at the time and obvious a day later: the
+        // far end ends up on our own track, loud enough for speaker
+        // attribution to vote it onto our side.
+        let voice = voiceProcessingRequested && !voiceProcessingGaveSilence && !storming
         do {
-            try attach()
+            try attach(voiceProcessing: voice)
+            return
         } catch {
-            log("[MicRecorder] ❌ Engine restart failed: \(error.localizedDescription) — retrying in 2s")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                guard let self = self, self.isRecording else { return }
-                self.restartCapture(reason: "retrying after a failed restart")
+            log("[MicRecorder] ❌ Engine restart failed: \(error.localizedDescription)")
+        }
+        if voice {
+            // The new route may be one the voice unit cannot take. Raw is worse
+            // than cancelled, and both beat no microphone at all.
+            do {
+                try attach(voiceProcessing: false)
+                log("[MicRecorder] Restarted raw — echo cancellation refused this route")
+                return
+            } catch {
+                log("[MicRecorder] ❌ Raw restart failed too: \(error.localizedDescription)")
             }
+        }
+        log("[MicRecorder] Retrying the restart in 2s")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, self.isRecording else { return }
+            self.restartCapture(reason: "retrying after a failed restart")
         }
     }
 

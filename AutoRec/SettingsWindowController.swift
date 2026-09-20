@@ -17,6 +17,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     // Recording
     private var autoDetectCheck: NSButton!
     private var recordScreenCheck: NSButton!
+    private var micEchoCancelCheck: NSButton!
     private var folderLabel: NSTextField!
 
     // Screen memory
@@ -45,7 +46,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private convenience init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 740),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 790),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false
         )
@@ -72,12 +73,15 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
-        y = 740 - 36
+        y = 790 - 36
 
         // ───────── Section: Запись звонков ─────────
         addHeader(content, "Запись звонков")
         autoDetectCheck = addCheckbox(content, "Авто-детект звонков (старт записи при разговоре)")
         recordScreenCheck = addCheckbox(content, "Записывать видео экрана во время звонка")
+        micEchoCancelCheck = addCheckbox(content, "Подавлять эхо на моей дорожке (по умолчанию выключено)")
+        addHint(content, "Включает режим Apple для звонков: собеседник перестаёт попадать на мою дорожку, "
+            + "но звук самого звонка может стать тише или прерываться.")
         addFolderRow(content)
         addSectionGap()
 
@@ -151,6 +155,17 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         content.addSubview(b)
         y -= 28
         return b
+    }
+
+    /// Small grey line under a control, for a risk the checkbox title cannot hold.
+    private func addHint(_ content: NSView, _ text: String) {
+        let lbl = makeLabel(text, size: 11)
+        lbl.textColor = .tertiaryLabelColor
+        lbl.lineBreakMode = .byWordWrapping
+        lbl.maximumNumberOfLines = 2
+        lbl.frame = NSRect(x: pad + 18, y: y - 6, width: fw - 18, height: 30)
+        content.addSubview(lbl)
+        y -= 34
     }
 
     private func addFolderRow(_ content: NSView) {
@@ -251,6 +266,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private func loadFromSettings() {
         autoDetectCheck.state = settings.autoDetect ? .on : .off
         recordScreenCheck.state = settings.recordScreen ? .on : .off
+        micEchoCancelCheck.state = settings.micVoiceProcessing ? .on : .off
         folderLabel.stringValue = settings.outputPath.replacingOccurrences(of: NSHomeDirectory(), with: "~")
 
         screenMemoryCheck.state = settings.screenMemoryEnabled ? .on : .off
@@ -271,6 +287,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private func applyToSettings() {
         settings.autoDetect = autoDetectCheck.state == .on
         settings.recordScreen = recordScreenCheck.state == .on
+        settings.micVoiceProcessing = micEchoCancelCheck.state == .on
 
         settings.screenMemoryEnabled = screenMemoryCheck.state == .on
         settings.saveClipboard = clipboardCheck.state == .on
