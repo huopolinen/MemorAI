@@ -39,13 +39,14 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var geminiKeyField: NSSecureTextField!
     private var geminiModelField: NSTextField!
     private var whisperRow: [NSView] = []
+    private var gigaamRow: [NSView] = []
     private var engineStatusLabel: NSTextField!
 
     private let langCodes = ["ru", "en", "auto"]
 
     private convenience init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 740),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 772),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false
         )
@@ -72,7 +73,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
-        y = 740 - 36
+        y = 772 - 36
 
         // ───────── Section: Запись звонков ─────────
         addHeader(content, "Запись звонков")
@@ -106,6 +107,10 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         geminiModelField = NSTextField()
         geminiRow += addPlainFieldRow(content, "Модель Gemini", field: geminiModelField,
                                       hint: "по умолчанию gemini-2.5-flash")
+
+        // GigaAM row
+        gigaamRow = addButtonRow(content, "GigaAM", buttonTitle: "Настроить / скачать модель…",
+                                 action: #selector(openGigaAMSetup))
 
         // Whisper row
         whisperRow = addButtonRow(content, "Локальный Whisper", buttonTitle: "Настроить / скачать модель…",
@@ -297,6 +302,9 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         setHidden(groqRow, kind != .groq)
         setHidden(geminiRow, kind != .gemini)
         setHidden(whisperRow, kind != .whisperLocal)
+        setHidden(gigaamRow, kind != .gigaam)
+
+        languagePopup.isEnabled = kind != .gigaam
 
         let engine = TranscriptionEngineFactory.engine(for: kind)
         if engine.isAvailable {
@@ -348,6 +356,10 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     @objc private func openWhisperSetup() {
         WhisperSetupWindowController.shared.show()
+    }
+
+    @objc private func openGigaAMSetup() {
+        GigaAMSetupWindowController.shared.show()
     }
 
     @objc private func closeWindow() {

@@ -2,7 +2,7 @@
 
 Remembers everything you do on your computer for AI.
 
-MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Everything stays local on your machine: screenshots are OCR'd via Apple Vision, calls are transcribed via whisper.cpp. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
+MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Everything stays local on your machine: screenshots are OCR'd via Apple Vision, calls are transcribed offline by GigaAM (Russian) or whisper.cpp. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
 
 ## Features
 
@@ -24,7 +24,7 @@ MemorAI sits in your menu bar and silently captures your digital life — screen
 - **Auto-detection** — monitors mic usage, starts recording when a call begins (Zoom, Teams, FaceTime, etc.)
 - **Dual-track audio** — system audio + microphone as separate files
 - **Screen recording** — optional 10 fps H.264 capture during calls
-- **Local transcription** — whisper.cpp transcribes after each call, no cloud needed
+- **Local transcription** — GigaAM v3 (Russian, bundled runtime) or whisper.cpp, offline; Groq/Gemini optional
 - **Efficient codecs** — HE-AAC keeps files small (~5 MB/hour per track)
 
 ### General
@@ -49,6 +49,9 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
 ./memorai screenshots [date]  # list captures for a day
 ./memorai clipboard [count]   # show clipboard history
 ./memorai ocr [date] [count]  # show OCR text from screenshots
+./memorai model status        # is the GigaAM model downloaded?
+./memorai model download      # fetch it (~260 MB, checksum-verified)
+./memorai set engine gigaam   # gigaam | whisper_local | groq | gemini
 ./memorai set <key> <value>   # change settings
 ./memorai exclude add|remove|list  # manage excluded apps
 ./memorai start|stop|restart  # control the app
@@ -59,7 +62,7 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
 - Start/Stop/Pause call recording
 - Auto-detect Calls (on/off)
 - Record Screen during calls (on/off)
-- Auto-transcribe via Whisper (on/off)
+- Auto-transcribe (on/off), showing the selected engine
 - Screen Memory (on/off)
 - Save Clipboard (on/off)
 - Clipboard History (last 100 entries)
@@ -84,14 +87,44 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
 
 ## Transcription Setup
 
+`ffmpeg` is required for every engine:
+
 ```bash
-brew install ffmpeg whisper-cpp
+brew install ffmpeg
+```
+
+### GigaAM — Russian, offline (default)
+
+Sber's GigaAM v3, run by the `transcribe.cpp` runtime that ships inside the app.
+No Homebrew package, no API key, and none of Whisper's YouTube-subtitle
+hallucinations ("Субтитры сделал…") on pauses. Russian only.
+
+Settings → Расшифровка → GigaAM → *Настроить / скачать модель…*, or:
+
+```bash
+./memorai model download     # ~260 MB into ~/.local/share/gigaam-models/
+./memorai set engine gigaam
+```
+
+The model is pinned to one Hugging Face revision and verified by size and
+SHA-256 before it is used.
+
+### Whisper — multilingual, offline
+
+```bash
+brew install whisper-cpp
 mkdir -p ~/.local/share/whisper-models
 curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin" \
   -o ~/.local/share/whisper-models/ggml-base.bin
 ```
 
-For better Russian recognition, use `ggml-medium.bin` instead.
+For better Russian recognition, use `ggml-medium.bin` instead — though on
+Russian, GigaAM beats it at a fifth of the size.
+
+### Groq / Gemini — cloud
+
+Paste an API key in Settings. Audio leaves the machine; everything else here
+does not.
 
 ## License
 
