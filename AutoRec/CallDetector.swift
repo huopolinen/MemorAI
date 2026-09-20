@@ -33,7 +33,7 @@ class CallDetector {
     private(set) var micSilent = false
     private(set) var systemAudioAvailable = true
 
-    private let ourPID: pid_t = getpid()
+    private static let ourPID: pid_t = getpid()
 
     func startMonitoring() {
         stopMonitoring()
@@ -41,7 +41,7 @@ class CallDetector {
             self?.checkStatus()
         }
         timer?.tolerance = 0.5
-        log("[CallDetector] Started monitoring (poll every \(pollInterval)s, our pid=\(ourPID))")
+        log("[CallDetector] Started monitoring (poll every \(pollInterval)s, our pid=\(Self.ourPID))")
     }
 
     func stopMonitoring() {
@@ -96,7 +96,7 @@ class CallDetector {
     // MARK: - Poll
 
     private func checkStatus() {
-        let foreign = foreignMicHolders()
+        let foreign = Self.foreignMicHolders()
         let inCall = !foreign.isEmpty
 
         if inCall {
@@ -126,8 +126,17 @@ class CallDetector {
 
     // MARK: - Per-process CoreAudio query
 
-    private struct ForeignMicHolder {
+    /// A process other than us that is holding the microphone right now.
+    ///
+    /// Exposed (rather than being a detail of call detection) because the mic
+    /// track needs the same answer for a different question: the device the
+    /// call app is listening to is the microphone the person is talking into,
+    /// and that is the one worth recording — see `MicRoute`.
+    struct ForeignMicHolder {
         let pid: pid_t
+        /// Core Audio's per-process object, which is what
+        /// `kAudioProcessPropertyDevices` is asked of.
+        let object: AudioObjectID
         var label: String {
             if let app = NSRunningApplication(processIdentifier: pid),
                let name = app.localizedName ?? app.bundleIdentifier {
@@ -138,7 +147,7 @@ class CallDetector {
     }
 
     /// Enumerates audio process objects and returns ones (other than us) capturing mic input.
-    private func foreignMicHolders() -> [ForeignMicHolder] {
+    static func foreignMicHolders() -> [ForeignMicHolder] {
         var listAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyProcessObjectList,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -165,7 +174,7 @@ class CallDetector {
             let pid = processPID(obj)
             guard pid > 0, pid != ourPID else { continue }
             guard isUserFacingProcess(pid: pid) else { continue }
-            holders.append(ForeignMicHolder(pid: pid))
+            holders.append(ForeignMicHolder(pid: pid, object: obj))
         }
         return holders
     }
@@ -173,7 +182,7 @@ class CallDetector {
     /// Returns false for system daemons (corespeechd, assistantd, coreaudiod, etc.) that
     /// hold the mic for background OS features like Siri / dictation and should never be
     /// treated as call activity. Anything shipping from /System or /usr/libexec qualifies.
-    private func isUserFacingProcess(pid: pid_t) -> Bool {
+    private static func isUserFacingProcess(pid: pid_t) -> Bool {
         guard let path = executablePath(pid: pid) else { return false }
         if path.hasPrefix("/System/") { return false }
         if path.hasPrefix("/usr/libexec/") { return false }
@@ -182,7 +191,7 @@ class CallDetector {
         return true
     }
 
-    private func executablePath(pid: pid_t) -> String? {
+    private static func executablePath(pid: pid_t) -> String? {
         // PROC_PIDPATHINFO_MAXSIZE = 4 * MAXPATHLEN, plenty for any real path
         var buffer = [CChar](repeating: 0, count: 4 * 1024)
         let bytes = proc_pidpath(pid, &buffer, UInt32(buffer.count))
@@ -190,7 +199,7 @@ class CallDetector {
         return String(cString: buffer)
     }
 
-    private func processIsRunningInput(_ object: AudioObjectID) -> Bool {
+    private static func processIsRunningInput(_ object: AudioObjectID) -> Bool {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioProcessPropertyIsRunningInput,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -204,7 +213,7 @@ class CallDetector {
         return value != 0
     }
 
-    private func processPID(_ object: AudioObjectID) -> pid_t {
+    private static func processPID(_ object: AudioObjectID) -> pid_t {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioProcessPropertyPID,
             mScope: kAudioObjectPropertyScopeGlobal,

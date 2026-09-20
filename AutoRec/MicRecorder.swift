@@ -76,6 +76,10 @@ class MicRecorder {
     /// Wall-clock times of this session's restarts, newest last — used only to
     /// notice a restart storm.
     private var restartTimes: [Date] = []
+    /// Microphones the engine would not take. Without this, a device the call
+    /// app is on but AVAudioEngine refuses is re-chosen every route tick and
+    /// restarts capture forever.
+    private var unbindableDevices: Set<AudioObjectID> = []
 
     // MARK: Echo cancellation (off by default — see SettingsManager.micVoiceProcessing)
     //
@@ -189,7 +193,11 @@ class MicRecorder {
     private func attach(voiceProcessing: Bool) throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
+        // Binding happens before a single format is read: the audio unit builds
+        // its graph around whatever it was pointed at, so a device chosen after
+        // the format has been resolved is a device the engine is not on.
         let device = MicRoute.preferred()
+        let chosen = bindInputDevice(of: inputNode, to: device)
 
         // Echo cancellation, when the session asked for it. A route the voice
         // unit refuses is not fatal — raw capture is what we would have done
@@ -275,24 +283,69 @@ class MicRecorder {
             }
         }
 
-        if let nsError = nsError {
+        let failure: Error? = nsError.map { MicRecorderError.engineException($0.localizedDescription) }
+            ?? startError
+        if let failure = failure {
             inputNode.removeTap(onBus: 0)
-            throw MicRecorderError.engineException(nsError.localizedDescription)
-        }
-        if let startError = startError {
-            inputNode.removeTap(onBus: 0)
-            throw startError
+            if let chosen = chosen {
+                // A microphone of our own choosing is the first suspect, and the
+                // engine refusing it must not cost the session its mic: remember
+                // the refusal and build the engine again on the default.
+                unbindableDevices.insert(chosen)
+                log("[MicRecorder] ⚠️ Engine refused \(AudioDevices.name(of: chosen) ?? "the call app's mic") "
+                    + "(\(failure.localizedDescription)) — retrying on the default input")
+                return try attach(voiceProcessing: voiceProcessing)
+            }
+            throw failure
         }
 
         self.engine = engine
         self.attachedAt = Date()
-        self.boundDevice = device?.id
+        // What capture is actually on, which is the chosen device only if the
+        // engine took it — otherwise the default it fell back to.
+        self.boundDevice = chosen ?? AudioDevices.defaultInput()
         self.voiceProcessingActive = inputNode.isVoiceProcessingEnabled
         armVoiceLiveness(format: tapFormat)
 
         let shape = tapFormat.map { "\(Int($0.sampleRate))Hz/1ch (echo-cancelled)" }
             ?? "\(Int(probeFormat.sampleRate))Hz/\(probeFormat.channelCount)ch (native, no resampling)"
-        log("[MicRecorder] Engine started on \(device?.name ?? "default input"): \(shape)")
+        let onDevice = AudioDevices.name(of: boundDevice) ?? device?.name ?? "default input"
+        log("[MicRecorder] Engine started on \(onDevice): \(shape)")
+    }
+
+    /// Point this engine at the microphone we mean to record, and answer with
+    /// the device it ended up on (nil = the system default, which an engine
+    /// picks up by itself).
+    ///
+    /// Only a device that is *not* the default is bound explicitly. The
+    /// ordinary case — the call app on the same microphone as everything else
+    /// — therefore goes through exactly the code path it did before, which is
+    /// what keeps a device the audio unit dislikes out of everyone's way.
+    ///
+    /// A refusal is not fatal: capture continues on the default, which is where
+    /// it would have been anyway. It is logged because it means our track and
+    /// the call are listening to different microphones.
+    private func bindInputDevice(of input: AVAudioInputNode, to device: MicRoute.Device?) -> AudioObjectID? {
+        guard let device = device,
+              device.id != AudioDevices.defaultInput(),
+              !unbindableDevices.contains(device.id)
+        else { return nil }
+
+        var setError: Error?
+        let raised = objc_tryCatch {
+            do {
+                try input.auAudioUnit.setDeviceID(device.id)
+            } catch let error {
+                setError = error
+            }
+        }
+        if let reason = raised?.localizedDescription ?? setError?.localizedDescription {
+            unbindableDevices.insert(device.id)
+            log("[MicRecorder] ⚠️ Cannot record \(device.name ?? "?") (\(reason)) — using the default mic")
+            return nil
+        }
+        log("[MicRecorder] Recording \(device.name ?? "?"), the microphone the call is on")
+        return device.id
     }
 
     private func teardownEngine() {
@@ -655,11 +708,14 @@ class MicRecorder {
     /// one we are on.
     private func checkRoute() {
         guard isRecording, !restartPending else { return }
-        guard let wanted = MicRoute.preferred(), wanted.id != boundDevice else { return }
+        guard let wanted = MicRoute.preferred(), wanted.id != boundDevice,
+              !unbindableDevices.contains(wanted.id)
+        else { return }
         let target = wanted.id
         DispatchQueue.main.asyncAfter(deadline: .now() + routeSettle) { [weak self] in
             guard let self = self, self.isRecording, !self.restartPending else { return }
-            guard let now = MicRoute.preferred(), now.id == target, now.id != self.boundDevice
+            guard let now = MicRoute.preferred(), now.id == target, now.id != self.boundDevice,
+                  !self.unbindableDevices.contains(now.id)
             else { return }
             let was = AudioDevices.name(of: self.boundDevice) ?? "?"
             self.restartCapture(reason: "microphone moved to \(now.name ?? "?") (was \(was))")
