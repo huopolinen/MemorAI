@@ -3,10 +3,16 @@ import Foundation
 /// Orchestrates transcription of a recording session:
 /// merges mic + system audio → a canonical 16 kHz mono WAV → splits into
 /// 10-minute segments → hands each segment to the selected `TranscriptionEngine`
-/// → assembles, de-duplicates, and saves the transcript.
+/// → assembles, de-duplicates, attributes each phrase to a speaker, and saves
+/// the transcript as both readable text and machine-readable JSON.
 ///
 /// The engine (local Whisper, Groq, or Gemini) is chosen in Settings; this class
 /// is engine-agnostic and only owns the engine-independent audio pipeline.
+///
+/// The mix is what the engine hears, and mixing is lossy in exactly the way
+/// that matters: two people become one voice. That is why the merged file is
+/// only ever the *input* here, and the original two tracks stay open until the
+/// transcript has been attributed — see `SpeakerAttribution`.
 class Transcriber {
     static let shared = Transcriber()
 
@@ -31,6 +37,13 @@ class Transcriber {
     /// fills the other's gaps), and aggressive internal trimming risks clipping quiet
     /// speech. Mid-call hallucinations on noisy pauses are left to the LLM polisher.
     /// `areverse` flips the stream so the same head-trim also cleans the tail.
+    ///
+    /// Only the fallback now: it deletes an unknown amount of audio, so after it
+    /// the transcript's clock has no known relationship to the tracks and speaker
+    /// attribution is impossible. The normal path trims to bounds measured from
+    /// the tracks themselves (`SpeakerAttribution.speechBounds`), which does the
+    /// same job and says by how much. This filter is what is left when a track
+    /// cannot be read by AVFoundation at all.
     private let silenceFilter =
         "silenceremove=start_periods=1:start_duration=0:start_threshold=-50dB:detection=peak,"
         + "areverse,"
@@ -79,11 +92,13 @@ class Transcriber {
                 .replacingOccurrences(of: "_mic", with: "")
                 .replacingOccurrences(of: "_system", with: "")
                 .replacingOccurrences(of: "call_", with: "")
-            let transcriptBase = dir.appendingPathComponent(
-                baseName.replacingOccurrences(of: "_mic", with: "_transcript")
-                        .replacingOccurrences(of: "_system", with: "_transcript")
-            )
+            // "call_<timestamp>" — the name the session's meta.json goes by.
+            let tag = baseName
+                .replacingOccurrences(of: "_mic", with: "")
+                .replacingOccurrences(of: "_system", with: "")
+            let transcriptBase = dir.appendingPathComponent("\(tag)_transcript")
             let txtPath = transcriptBase.appendingPathExtension("txt")
+            let jsonPath = transcriptBase.appendingPathExtension("json")
 
             if FileManager.default.fileExists(atPath: txtPath.path) {
                 log("[Transcriber] Transcript already exists: \(txtPath.lastPathComponent)")
@@ -91,30 +106,69 @@ class Transcriber {
                 return
             }
 
+            // ── Read both tracks once ───────────────────────────────────────────
+            // The envelopes pay for themselves twice: they say where the speech
+            // starts and ends (the silence trim) and which track was loud under
+            // each phrase (the speaker labels).
+            let attribution = SpeakerAttribution(
+                mic: micOK ? micURL : nil, system: sysOK ? systemURL : nil)
+            if attribution == nil {
+                log("[Transcriber] ⚠️ дорожки не читаются через AVFoundation — обрезаю тишину фильтром, без меток говорящих")
+            }
+
+            // Where the transcript's clock sits inside the tracks. Every segment
+            // time the engine returns is relative to the trimmed mix, so this is
+            // what turns it back into a position in the original recording.
+            var trimStart: TimeInterval = 0
+            var trimLength: TimeInterval?
+            if let attribution {
+                guard let bounds = attribution.speechBounds() else {
+                    log("[Transcriber] Ни на одной дорожке нет речи — расшифровывать нечего")
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
+                // Never seek past the end of the shorter track: the mix needs
+                // both inputs to still have audio at that point.
+                let shortest = [micOK ? micDur : nil, sysOK ? sysDur : nil].compactMap { $0 }.min() ?? 0
+                trimStart = max(0, min(bounds.start, shortest - minTrackDuration))
+                let end = min(bounds.end, max(micDur, sysDur))
+                trimLength = max(0, end - trimStart)
+                guard (trimLength ?? 0) >= minSpeechDuration else {
+                    log(String(format: "[Transcriber] Речи всего %.1f с — пропускаю расшифровку", trimLength ?? 0))
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
+                log(String(format: "[Transcriber] Речь с %.1f с по %.1f с записи", trimStart, end))
+            }
+
             // ── Merge → canonical 16 kHz mono WAV ───────────────────────────────
-            let mergedWav = dir.appendingPathComponent(
-                baseName.replacingOccurrences(of: "_mic", with: "_merged")
-                        .replacingOccurrences(of: "_system", with: "_merged") + ".wav"
-            )
+            let mergedWav = dir.appendingPathComponent("\(tag)_merged.wav")
             log("[Transcriber] Preparing audio (\(micOK && sysOK ? "merge mic+system" : (micOK ? "mic only" : "system only")))")
-            let merge: Subprocess.Result
+
+            // `-ss` before each `-i` seeks every input by the same amount, so the
+            // two tracks stay in step with each other and with `trimStart`.
+            var args = ["-y"]
             if micOK && sysOK {
-                merge = Subprocess.run(ffmpegPath, args: [
-                    "-y", "-i", micURL!.path, "-i", systemURL!.path,
-                    "-filter_complex",
-                    "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[mic];"
+                if trimLength != nil { args += ["-ss", seconds(trimStart)] }
+                args += ["-i", micURL!.path]
+                if trimLength != nil { args += ["-ss", seconds(trimStart)] }
+                args += ["-i", systemURL!.path]
+                if let trimLength { args += ["-t", seconds(trimLength)] }
+                let mix = "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[mic];"
                     + "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[sys];"
-                    + "[mic][sys]amix=inputs=2:duration=longest,\(silenceFilter)[a]",
-                    "-map", "[a]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-                    mergedWav.path,
-                ])
+                    + "[mic][sys]amix=inputs=2:duration=longest"
+                args += ["-filter_complex", trimLength != nil ? mix + "[a]" : mix + ",\(silenceFilter)[a]",
+                         "-map", "[a]"]
             } else {
                 let sourceURL = micOK ? micURL! : systemURL!
-                merge = Subprocess.run(ffmpegPath, args: [
-                    "-y", "-i", sourceURL.path, "-af", silenceFilter,
-                    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", mergedWav.path,
-                ])
+                if trimLength != nil { args += ["-ss", seconds(trimStart)] }
+                args += ["-i", sourceURL.path]
+                if let trimLength { args += ["-t", seconds(trimLength)] }
+                if trimLength == nil { args += ["-af", silenceFilter] }
             }
+            args += ["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", mergedWav.path]
+
+            let merge = Subprocess.run(ffmpegPath, args: args)
             guard merge.ok else {
                 log("[Transcriber] ❌ ffmpeg merge failed (exit \(merge.exitCode)): \(merge.stderr.suffix(500))")
                 DispatchQueue.main.async { completion() }
@@ -136,6 +190,27 @@ class Transcriber {
             // ── Segment → engine ────────────────────────────────────────────────
             let fmt = engine.inputFormat
             var fullTranscript = ""
+            // Every timed phrase of the call, on the merged file's clock.
+            // Becomes nil the moment one chunk comes back without timings: a
+            // transcript with a ten-minute hole in the middle is worse than an
+            // honest unlabelled one.
+            var timedSegments: [TranscriptSegment]? = []
+
+            func absorb(_ result: TranscriptionResult?, chunkOffset: Double) {
+                guard let result else { return }
+                fullTranscript += result.text
+                guard let segments = result.segments else {
+                    if timedSegments != nil {
+                        log("[Transcriber] движок не дал таймкодов для куска — метки говорящих для этой записи отключаю")
+                    }
+                    timedSegments = nil
+                    return
+                }
+                timedSegments? += segments.map {
+                    TranscriptSegment(start: $0.start + chunkOffset, end: $0.end + chunkOffset,
+                                      text: $0.text, speaker: $0.speaker)
+                }
+            }
 
             if duration <= chunkSec * 1.5 {
                 // Whole file in one shot.
@@ -152,7 +227,8 @@ class Transcriber {
                     }
                 }
                 log("[Transcriber] Transcribing (\(Int(duration))s) via \(engine.kind.rawValue)…")
-                fullTranscript = engine.transcribe(audioURL: segURL, language: SettingsManager.shared.whisperLanguage) ?? ""
+                absorb(engine.transcribeDetailed(audioURL: segURL, language: SettingsManager.shared.whisperLanguage),
+                       chunkOffset: 0)
                 if segURL != mergedWav { try? FileManager.default.removeItem(at: segURL) }
             } else {
                 let chunks = Int(ceil(duration / chunkSec))
@@ -162,40 +238,115 @@ class Transcriber {
                     let segURL = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i).\(fmt.fileExtension)")
                     guard makeSegment(from: mergedWav, offset: offset, length: chunkSec, format: fmt, to: segURL) else {
                         log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) encode failed, skipping")
+                        // A missing chunk is a hole in the timeline; whatever
+                        // comes after it would be attributed against the wrong
+                        // part of the tracks.
+                        timedSegments = nil
                         continue
                     }
                     log("[Transcriber] [\(sessionTag)]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s…")
-                    if let text = engine.transcribe(audioURL: segURL, language: SettingsManager.shared.whisperLanguage) {
-                        fullTranscript += text
-                    } else {
+                    let result = engine.transcribeDetailed(
+                        audioURL: segURL, language: SettingsManager.shared.whisperLanguage)
+                    if result == nil {
                         log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) produced no text")
+                        timedSegments = nil
                     }
+                    // Chunk i starts `offset` seconds into the merged file, so
+                    // its segment times need that added back to be comparable.
+                    absorb(result, chunkOffset: offset)
                     try? FileManager.default.removeItem(at: segURL)
                 }
             }
 
+            // ── Clean, attribute, save ──────────────────────────────────────────
+            var attributed: SpeakerAttribution.Attribution?
+            var cleanedSegments: [TranscriptSegment]?
+            if let timedSegments, !timedSegments.isEmpty {
+                // The same hallucination/loop cleanup as the plain path, applied
+                // per segment so the timeline survives it.
+                cleanedSegments = Self.cleanSegments(timedSegments)
+                if let cleanedSegments, !cleanedSegments.isEmpty,
+                   let attribution, attribution.hasBothTracks {
+                    attributed = attribution.attribute(
+                        segments: cleanedSegments, offset: trimStart, reference: mergedWav)
+                } else if attribution?.hasBothTracks != true {
+                    log("[Transcriber] одна дорожка — таймкоды пишу, метки говорящих нет")
+                }
+            } else if !engine.providesTimestamps {
+                log("[Transcriber] движок \(engine.kind.rawValue) не даёт таймкодов — транскрипт без меток говорящих")
+            }
+
             try? FileManager.default.removeItem(at: mergedWav)
 
-            if !fullTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                try? fullTranscript.write(to: txtPath, atomically: true, encoding: .utf8)
-                deduplicateTranscript(at: txtPath)
-                log("[Transcriber] ✅ Transcript saved: \(txtPath.lastPathComponent)")
-
-                // Polish raw ASR output (capitalization/punctuation/paragraphs) via the
-                // Groq LLM. Gemini already returns formatted text, so skip it there.
-                let groqKey = SettingsManager.shared.groqApiKey
-                if SettingsManager.shared.polishTranscripts, engine.kind != .gemini, !groqKey.isEmpty,
-                   let raw = try? String(contentsOf: txtPath, encoding: .utf8),
-                   let polished = TranscriptPolisher.polish(raw, apiKey: groqKey) {
-                    try? polished.write(to: txtPath, atomically: true, encoding: .utf8)
-                    log("[Transcriber] ✨ Transcript polished (punctuation/paragraphs)")
-                }
+            let plain = Self.cleanText(fullTranscript)
+            let body: String
+            if let attributed, !attributed.segments.isEmpty {
+                body = TranscriptDocument.plainText(attributed.segments, suffixes: attributed.suffixes)
             } else {
+                body = plain
+            }
+
+            guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 log("[Transcriber] ❌ Engine produced no output")
+                DispatchQueue.main.async { completion() }
+                return
+            }
+
+            try? body.write(to: txtPath, atomically: true, encoding: .utf8)
+            log("[Transcriber] ✅ Transcript saved: \(txtPath.lastPathComponent)")
+
+            // The JSON is the whole point of the archive: it keeps the engine's
+            // exact wording and timings even when the .txt beside it has been
+            // through the polisher, which is good for eyes and lossy for
+            // analysis. Written whenever there are timings at all — times
+            // without sides still beat prose without either.
+            var tracks: [String: String] = [:]
+            if micOK, let micURL { tracks["mic"] = micURL.lastPathComponent }
+            if sysOK, let systemURL { tracks["system"] = systemURL.lastPathComponent }
+            if let json = TranscriptDocument.json(
+                tag: tag, engine: engine.kind.rawValue,
+                language: SettingsManager.shared.whisperLanguage,
+                segments: attributed?.segments,
+                plainSegments: cleanedSegments,
+                suffixes: attributed?.suffixes ?? [:],
+                trackOffset: trimStart, tracks: tracks
+            ) {
+                try? json.write(to: jsonPath, options: .atomic)
+                log("[Transcriber] ✅ \(jsonPath.lastPathComponent): \(cleanedSegments?.count ?? 0) сегментов"
+                    + (attributed != nil ? ", с метками говорящих" : ", без меток говорящих"))
+            } else {
+                // A previous run may have left one; it would now describe text
+                // that is no longer there.
+                try? FileManager.default.removeItem(at: jsonPath)
+            }
+
+            // Tell the session what it now has, so anything reading the folder
+            // later (the CLI, an AI, a future us) knows without opening files.
+            SessionMeta.update(tag: tag, in: dir, with: [
+                "speakers": attributed != nil,
+                "transcript_json": cleanedSegments != nil ? jsonPath.lastPathComponent : nil,
+            ])
+
+            // Polish raw ASR output (capitalization/punctuation/paragraphs) via the
+            // Groq LLM. Gemini already returns formatted text, so skip it there.
+            let groqKey = SettingsManager.shared.groqApiKey
+            if SettingsManager.shared.polishTranscripts, engine.kind != .gemini, !groqKey.isEmpty,
+               let raw = try? String(contentsOf: txtPath, encoding: .utf8),
+               let polished = TranscriptPolisher.polish(
+                   raw, apiKey: groqKey, speakerLabels: attributed != nil) {
+                try? polished.write(to: txtPath, atomically: true, encoding: .utf8)
+                log("[Transcriber] ✨ Transcript polished (punctuation/paragraphs)")
             }
 
             DispatchQueue.main.async { completion() }
         }
+    }
+
+    /// ffmpeg wants a plain number of seconds; milliseconds are enough and keep
+    /// the offset honest (an integer `-ss` would shift the clock by up to a
+    /// second, which is several speaker turns' worth of error).
+    private func seconds(_ value: Double) -> String {
+        String(format: "%.3f", value)
     }
 
     /// Extract/encode a segment of `mergedWav` into `format` at `out`.
@@ -228,16 +379,15 @@ class Transcriber {
         return 0
     }
 
-    /// Remove hallucination loops: exact duplicates and near-duplicate runs.
-    private func deduplicateTranscript(at url: URL) {
-        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return }
+    // MARK: - Cleanup
 
-        // Pass -1: strip known Whisper hallucinations. On silence/music, whisper-large
-        // emits boilerplate learned from YouTube subtitle data — subtitle credits and
-        // "to be continued" stings — that no amount of speech is actually present for.
-        // Deterministic and always-on (unlike the LLM polisher, which is optional and
-        // occasionally keeps a credit embedded mid-sentence), so it's the reliable floor.
-        var content = raw
+    /// Strip known Whisper hallucinations. On silence/music, whisper-large emits
+    /// boilerplate learned from YouTube subtitle data — subtitle credits and
+    /// "to be continued" stings — that no amount of speech is actually present for.
+    /// Deterministic and always-on (unlike the LLM polisher, which is optional and
+    /// occasionally keeps a credit embedded mid-sentence), so it's the reliable floor.
+    private static func stripHallucinations(_ text: String) -> String {
+        var content = text
         let hallucinationPatterns = [
             #"Продолжение следует[.…\s]*"#,
             #"Субтитры (?:сделал|делал|создавал|подготовил)[^.!?\n]*?DimaTorzok[.!?]*"#,
@@ -259,17 +409,23 @@ class Transcriber {
                 in: content, range: NSRange(content.startIndex..., in: content), withTemplate: " ")
         }
 
-        // Pass 0: collapse in-line filler loops. LLM engines (Gemini) emit long
-        // runs of a backchannel token on filler-heavy audio, e.g.
-        // "Угу. Угу. Угу. Угу. …" all on one line — invisible to the line passes.
-        // Collapse 3+ consecutive repeats of the same short token to a single one.
+        // Collapse in-line filler loops. LLM engines (Gemini) emit long runs of a
+        // backchannel token on filler-heavy audio, e.g. "Угу. Угу. Угу. Угу. …"
+        // all on one line — invisible to the line passes. Collapse 3+ consecutive
+        // repeats of the same short token to a single one.
         if let re = try? NSRegularExpression(
             pattern: #"(\b[\p{L}\p{N}]{1,15}[.,!?…]*)(?:\s+\1){2,}"#,
             options: [.caseInsensitive]) {
             content = re.stringByReplacingMatches(
                 in: content, range: NSRange(content.startIndex..., in: content), withTemplate: "$1")
         }
+        return content
+    }
 
+    /// Remove hallucination loops from plain text: exact duplicates and
+    /// near-duplicate runs, line by line.
+    static func cleanText(_ raw: String) -> String {
+        let content = stripHallucinations(raw)
         let lines = content.components(separatedBy: "\n")
 
         // Pass 1: collapse exact consecutive duplicates
@@ -306,9 +462,66 @@ class Transcriber {
             i += 1
         }
 
-        let cleaned = result.joined(separator: "\n")
-        try? cleaned.write(to: url, atomically: true, encoding: .utf8)
         let removed = lines.count - result.count
         if removed > 0 { log("[Transcriber] Dedup: removed \(removed) hallucinated lines") }
+        return result.joined(separator: "\n")
+    }
+
+    /// The same cleanup, applied to timed segments instead of lines.
+    ///
+    /// It has to be the segment and not the rendered text, because the text is
+    /// rendered *after* attribution: deleting a line afterwards would leave the
+    /// JSON describing phrases the .txt no longer contains, and a hallucinated
+    /// segment would first get a speaker label and a timestamp of its own.
+    static func cleanSegments(_ segments: [TranscriptSegment]) -> [TranscriptSegment] {
+        // Pass 1: hallucination patterns; a segment that was nothing but a
+        // subtitle credit disappears entirely.
+        var cleaned: [TranscriptSegment] = []
+        for segment in segments {
+            var copy = segment
+            copy.text = stripHallucinations(segment.text)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !copy.text.isEmpty else { continue }
+            cleaned.append(copy)
+        }
+
+        // Pass 2: exact consecutive duplicates. Whisper loops repeat the same
+        // phrase for minutes; one of them is the real one.
+        var deduped: [TranscriptSegment] = []
+        for segment in cleaned {
+            if let last = deduped.last, last.text == segment.text {
+                // Keep the first occurrence but stretch it over the loop, so the
+                // timeline has no gap where the repeats were.
+                deduped[deduped.count - 1].end = max(last.end, segment.end)
+                continue
+            }
+            deduped.append(segment)
+        }
+
+        // Pass 3: near-duplicate runs (same 15-char prefix, 3+ in a row).
+        let prefixLen = 15
+        var result: [TranscriptSegment] = []
+        var i = 0
+        while i < deduped.count {
+            let text = deduped[i].text
+            if text.count >= prefixLen {
+                let prefix = String(text.prefix(prefixLen))
+                var runEnd = i + 1
+                while runEnd < deduped.count, deduped[runEnd].text.hasPrefix(prefix) { runEnd += 1 }
+                if runEnd - i >= 3 {
+                    var kept = deduped[i]
+                    kept.end = deduped[runEnd - 1].end
+                    result.append(kept)
+                    i = runEnd
+                    continue
+                }
+            }
+            result.append(deduped[i])
+            i += 1
+        }
+
+        let removed = segments.count - result.count
+        if removed > 0 { log("[Transcriber] Dedup: убрано \(removed) зациклившихся сегментов") }
+        return result
     }
 }

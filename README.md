@@ -25,6 +25,8 @@ MemorAI sits in your menu bar and silently captures your digital life — screen
 - **Dual-track audio** — system audio + microphone as separate files
 - **Screen recording** — optional 10 fps H.264 capture during calls
 - **Local transcription** — whisper.cpp transcribes after each call, no cloud needed
+- **Who said what** — each phrase is credited to you or the other side by comparing
+  the two tracks' loudness (Whisper and Groq only; Gemini returns no timings)
 - **Efficient codecs** — HE-AAC keeps files small (~5 MB/hour per track)
 
 ### General
@@ -79,7 +81,8 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
   call_<timestamp>_system.m4a       # system audio
   call_<timestamp>_mic.m4a          # microphone
   call_<timestamp>_screen.mp4       # screen (if enabled)
-  call_<timestamp>_transcript.txt   # transcription (if enabled)
+  call_<timestamp>_transcript.txt   # transcription, "Я:" / "Собеседник:" (if enabled)
+  call_<timestamp>_transcript.json  # same, with timings + per-phrase speaker & confidence
 ```
 
 ## Transcription Setup
