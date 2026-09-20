@@ -18,6 +18,8 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var autoDetectCheck: NSButton!
     private var recordScreenCheck: NSButton!
     private var micEchoCancelCheck: NSButton!
+    private var systemAudioPopup: NSPopUpButton!
+    private var tapCallAppOnlyCheck: NSButton!
     private var folderLabel: NSTextField!
 
     // Screen memory
@@ -44,10 +46,11 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var engineStatusLabel: NSTextField!
 
     private let langCodes = ["ru", "en", "auto"]
+    private let audioSources = SystemAudioSource.allCases
 
     private convenience init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 822),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 882),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false
         )
@@ -74,7 +77,7 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
-        y = 822 - 36
+        y = 882 - 36
 
         // ───────── Section: Запись звонков ─────────
         addHeader(content, "Запись звонков")
@@ -83,6 +86,8 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         micEchoCancelCheck = addCheckbox(content, "Подавлять эхо на моей дорожке (по умолчанию выключено)")
         addHint(content, "Включает режим Apple для звонков: собеседник перестаёт попадать на мою дорожку, "
             + "но звук самого звонка может стать тише или прерываться.")
+        systemAudioPopup = addPopupRow(content, "Системный звук", items: audioSources.map { $0.displayName })
+        tapCallAppOnlyCheck = addCheckbox(content, "Core Audio: писать только приложение звонка (без музыки и уведомлений)")
         addFolderRow(content)
         addSectionGap()
 
@@ -272,6 +277,8 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         autoDetectCheck.state = settings.autoDetect ? .on : .off
         recordScreenCheck.state = settings.recordScreen ? .on : .off
         micEchoCancelCheck.state = settings.micVoiceProcessing ? .on : .off
+        systemAudioPopup.selectItem(at: audioSources.firstIndex(of: settings.systemAudioSource) ?? 0)
+        tapCallAppOnlyCheck.state = settings.tapCallAppOnly ? .on : .off
         folderLabel.stringValue = settings.outputPath.replacingOccurrences(of: NSHomeDirectory(), with: "~")
 
         screenMemoryCheck.state = settings.screenMemoryEnabled ? .on : .off
@@ -293,6 +300,8 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         settings.autoDetect = autoDetectCheck.state == .on
         settings.recordScreen = recordScreenCheck.state == .on
         settings.micVoiceProcessing = micEchoCancelCheck.state == .on
+        settings.systemAudioSource = audioSources[max(0, systemAudioPopup.indexOfSelectedItem)]
+        settings.tapCallAppOnly = tapCallAppOnlyCheck.state == .on
 
         settings.screenMemoryEnabled = screenMemoryCheck.state == .on
         settings.saveClipboard = clipboardCheck.state == .on
@@ -311,6 +320,9 @@ class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     private func refresh() {
+        // The scope switch only means anything on the Core Audio path.
+        tapCallAppOnlyCheck.isEnabled = settings.systemAudioSource == .coreAudioTap
+
         intervalValue.stringValue = "\(Int(intervalSlider.doubleValue.rounded())) сек"
         qualityValue.stringValue = String(format: "%.2f", qualitySlider.doubleValue)
         sensitivityValue.stringValue = "\(Int(sensitivitySlider.doubleValue.rounded()))"

@@ -1,5 +1,20 @@
 import Foundation
 
+/// How the far end of a call is captured.
+enum SystemAudioSource: String, CaseIterable {
+    /// ScreenCaptureKit — everything the Mac plays. The original path.
+    case screenCapture = "screen_capture"
+    /// Core Audio process tap — can be pointed at the call app alone.
+    case coreAudioTap = "core_audio_tap"
+
+    var displayName: String {
+        switch self {
+        case .screenCapture: return "Через запись экрана (как раньше)"
+        case .coreAudioTap: return "Через Core Audio (только звук звонка)"
+        }
+    }
+}
+
 class SettingsManager {
     static let shared = SettingsManager()
 
@@ -29,6 +44,27 @@ class SettingsManager {
             return defaults.bool(forKey: "recordScreen")
         }
         set { defaults.set(newValue, forKey: "recordScreen") }
+    }
+
+    /// Where the system track comes from. Default is the ScreenCaptureKit
+    /// path, which is the one that has been recording calls all along — the
+    /// Core Audio tap is offered next to it, not in place of it.
+    var systemAudioSource: SystemAudioSource {
+        get { SystemAudioSource(rawValue: defaults.string(forKey: "systemAudioSource") ?? "") ?? .screenCapture }
+        set { defaults.set(newValue.rawValue, forKey: "systemAudioSource") }
+    }
+
+    /// Core Audio path only: narrow the tap to the app the call is on instead
+    /// of recording everything the Mac plays. This is the reason that path
+    /// exists, so it is on by default — but it is a switch, because a call in
+    /// an app we fail to recognise is better recorded indiscriminately than
+    /// not at all.
+    var tapCallAppOnly: Bool {
+        get {
+            if defaults.object(forKey: "tapCallAppOnly") == nil { return true }
+            return defaults.bool(forKey: "tapCallAppOnly")
+        }
+        set { defaults.set(newValue, forKey: "tapCallAppOnly") }
     }
 
     var autoTranscribe: Bool {
