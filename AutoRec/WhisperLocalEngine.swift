@@ -97,8 +97,15 @@ final class WhisperLocalEngine: TranscriptionEngine {
             let text = segments.map(\.text).joined(separator: "\n")
             return TranscriptionResult(text: text, segments: segments)
         }
-        log("[WhisperLocal] ⚠️ JSON без сегментов — беру текст, метки говорящих в этом куске не будет")
         guard let text = try? String(contentsOf: txtURL, encoding: .utf8) else { return nil }
+        // No segments and no words either: this stretch of the call is silence,
+        // and silence has nothing to time. Answering with an empty list rather
+        // than nil says so — nil would mean the alignment was lost, and the
+        // caller pays for that with the speaker labels of the whole recording.
+        guard TranscriptText.hasSpeech(text) else {
+            return TranscriptionResult(text: "", segments: [])
+        }
+        log("[WhisperLocal] ⚠️ JSON без сегментов, а слова есть — беру текст, метки говорящих в этом куске не будет")
         return TranscriptionResult(text: text, segments: nil)
     }
 

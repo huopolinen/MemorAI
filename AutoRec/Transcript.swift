@@ -8,6 +8,34 @@ import Foundation
 /// was spoken, and which of the two tracks it came from. `TranscriptSegment`
 /// carries the first; `SpeakerAttribution` uses it to recover the second.
 
+/// Small questions about a piece of engine output that several places in the
+/// pipeline have to answer the same way.
+enum TranscriptText {
+    /// Whether anything was actually said here.
+    ///
+    /// Near-silence does not come back empty: a CTC decoder answers twenty
+    /// quiet seconds with a lone "." and no words. Punctuation deliberately
+    /// carries no time (see `GigaAMEngine.phrases`), so such a piece has text
+    /// and no timed segments — which reads exactly like "the runtime lost the
+    /// alignment", and used to be treated as such. It cost the whole call its
+    /// speaker labels and its _transcript.json for one quiet minute in the
+    /// middle of it. It is the opposite: there was nothing to time here, and
+    /// every other minute is still on the clock.
+    static func hasSpeech(_ text: String) -> Bool {
+        text.rangeOfCharacter(from: .alphanumerics) != nil
+    }
+
+    /// A fragment too small to be a word: one letter with a full stop after
+    /// it ("а.", "У.", "Д."), or bare punctuation. These are 2–7 % of GigaAM's
+    /// segments on real calls — decoder noise on breaths and half-heard
+    /// backchannels — and they are dropped when rendering the .txt a person
+    /// reads. The JSON keeps them: it is meant to be exactly what the engine
+    /// heard, timings and all.
+    static func isNoise(_ text: String) -> Bool {
+        text.unicodeScalars.filter(CharacterSet.alphanumerics.contains).count <= 1
+    }
+}
+
 /// One timed piece of what an engine heard, on the clock of the audio file the
 /// engine was handed.
 struct TranscriptSegment {
@@ -80,6 +108,9 @@ enum TranscriptDocument {
     /// Consecutive segments from the same speaker are joined into a single
     /// paragraph — the engine cuts a segment every few seconds, and a label on
     /// every line would read like a chat log of one person talking to himself.
+    ///
+    /// One-letter fragments are left out here (see `TranscriptText.isNoise`):
+    /// this is the file a person reads, and "Д." is not a word.
     static func plainText(_ segments: [AttributedSegment], suffixes: [String: String]) -> String {
         var out: [String] = []
         var currentName: String?
@@ -94,6 +125,9 @@ enum TranscriptDocument {
         for segment in segments {
             let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
+            // Dropped before the speaker is looked at, so a stray "а." between
+            // two turns of one person does not split his paragraph in two.
+            guard !TranscriptText.isNoise(text) else { continue }
             let name = displayName(side: segment.side, suffix: segment.label.flatMap { suffixes[$0] })
             if name != currentName {
                 flush()
