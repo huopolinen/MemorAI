@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 cd "$(dirname "$0")"
+source ./bundle-lib.sh
 
 # Pick a stable codesign identity so TCC keeps the permissions between rebuilds.
 # Override via SIGN_IDENTITY env, otherwise prefer "Developer ID Application",
@@ -28,23 +29,13 @@ cp .build/release/MemorAI MemorAI.app/Contents/MacOS/
 cp Info.plist MemorAI.app/Contents/
 cp MemorAI.icns MemorAI.app/Contents/Resources/ 2>/dev/null || true
 
-cat > /tmp/memorai-entitlements.plist << 'ENTITLEMENTS'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.device.audio-input</key>
-    <true/>
-</dict>
-</plist>
-ENTITLEMENTS
+echo "Embedding CTranscribe.framework (GigaAM runtime)..."
+embed_ctranscribe MemorAI.app
 
-echo "Signing with: $SIGN_IDENTITY"
-codesign --force --options runtime \
-    --sign "$SIGN_IDENTITY" \
-    --entitlements /tmp/memorai-entitlements.plist \
-    MemorAI.app
+echo "Signing with: $SIGN_IDENTITY  (framework first, then the app)"
+sign_bundle MemorAI.app "$SIGN_IDENTITY"
 
 echo ""
 echo "Built: MemorAI.app"
+report_archs MemorAI.app
 echo "  open MemorAI.app"
