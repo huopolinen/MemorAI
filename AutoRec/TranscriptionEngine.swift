@@ -61,6 +61,29 @@ protocol TranscriptionEngine {
     /// Transcribe one audio file. Returns text, or nil on failure (already logged).
     /// `language` is an ISO-639-1 code ("ru", "en") or "auto".
     func transcribe(audioURL: URL, language: String) -> String?
+
+    /// Transcribe one audio file and, if the engine can, say *when* each phrase
+    /// was spoken. Timings are what `SpeakerAttribution` needs to look up which
+    /// track was loud under each phrase, so an engine without them simply
+    /// produces a transcript with no speaker labels — nothing breaks.
+    ///
+    /// Where we stand: whisper.cpp writes segment offsets with `-oj`, Groq
+    /// returns them in `verbose_json`, and Gemini answers in prose and has none.
+    func transcribeDetailed(audioURL: URL, language: String) -> TranscriptionResult?
+}
+
+extension TranscriptionEngine {
+    /// Default for engines that only produce text. Deliberately not a failure:
+    /// "I cannot time this" is a normal answer, and the pipeline degrades to an
+    /// unlabelled transcript for it.
+    func transcribeDetailed(audioURL: URL, language: String) -> TranscriptionResult? {
+        guard let text = transcribe(audioURL: audioURL, language: language) else { return nil }
+        return TranscriptionResult(text: text, segments: nil)
+    }
+
+    /// Whether this engine can produce the timings speaker labels are built on.
+    /// Used only to explain the outcome in the log.
+    var providesTimestamps: Bool { kind != .gemini }
 }
 
 enum TranscriptionEngineFactory {
