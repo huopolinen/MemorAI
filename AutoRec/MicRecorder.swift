@@ -2,8 +2,12 @@ import Foundation
 import AVFoundation
 import ObjCSupport
 
-/// Records microphone audio (what you say) into a separate .m4a file
+/// Records microphone audio (what you say) into a separate .caf file
 /// using AVAudioEngine + AVAudioFile.
+///
+/// The track is uncompressed PCM, not AAC: that is what lets a call survive the
+/// process being killed mid-recording. `TrackCompressor` trades it for AAC once
+/// the transcript exists — see `AudioFormats` for why the order matters.
 ///
 /// Robustness features:
 /// - Listens to AVAudioEngineConfigurationChange (route changes kill the engine silently otherwise).
@@ -133,23 +137,17 @@ class MicRecorder {
         log("[MicRecorder] Engine started: probe \(Int(probeFormat.sampleRate))Hz/\(probeFormat.channelCount)ch (native, no resampling)")
     }
 
-    /// Creates the AAC output file matched to the input device's native rate and channel
+    /// Creates the PCM output file matched to the input device's native rate and channel
     /// count. The tap delivers buffers in the device's native format (24/48/96 kHz, mono
     /// or stereo); writing them into a hardcoded 48 kHz mono AVAudioFile silently packed
     /// samples at the wrong rate and produced 2× speed audio (1.4.0/1.4.1) or empty files
-    /// when manual AVAudioConverter conversion failed (1.4.2). Standard AAC accepts any
+    /// when manual AVAudioConverter conversion failed (1.4.2). Linear PCM accepts any
     /// sample rate and channel count, so writing in native format is reliable.
     private func makeAudioFile(format: AVAudioFormat) throws -> AVAudioFile {
-        let nativeChannels = format.channelCount
-        let fileSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: format.sampleRate,
-            AVNumberOfChannelsKey: nativeChannels,
-            AVEncoderBitRateKey: 32000 * Int(nativeChannels),
-        ]
         return try AVAudioFile(
             forWriting: outputURL,
-            settings: fileSettings,
+            settings: AudioFormats.pcmSettings(
+                sampleRate: format.sampleRate, channels: format.channelCount),
             commonFormat: .pcmFormatFloat32,
             interleaved: false
         )

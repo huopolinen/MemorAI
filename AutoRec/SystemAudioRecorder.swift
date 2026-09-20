@@ -4,14 +4,24 @@ import AVFoundation
 import CoreVideo
 
 /// Captures system audio and optionally screen via a single SCStream.
-/// System audio → .m4a file, screen → .mp4 file (if enabled).
+/// System audio → .caf file, screen → .mp4 file (if enabled).
+///
+/// The audio track is written as uncompressed PCM through AVAudioFile rather
+/// than as AAC through AVAssetWriter, and that is deliberate: an AVAssetWriter
+/// .m4a is unreadable until `finishWriting` completes, so a process killed
+/// mid-call left nothing at all (1.5.2's SIGABRT). A PCM CAF is readable at
+/// every instant — see `AudioFormats`. Video has no such option and stays on
+/// AVAssetWriter.
 class SystemAudioRecorder: NSObject {
     private var stream: SCStream?
 
-    // Audio writer
-    private var audioWriter: AVAssetWriter?
-    private var audioInput: AVAssetWriterInput?
-    private var audioSessionStarted = false
+    // Audio track (uncompressed PCM, created lazily from the first buffer's format)
+    private var audioFile: AVAudioFile?
+    private var audioWriteErrorCount = 0
+    private let maxAudioWriteErrors = 5
+    /// Set when the audio track has given up. Kept separate from `isRecording`
+    /// so a dead audio file doesn't also silently end the screen recording.
+    private var audioFailed = false
     private let audioURL: URL
 
     // Video writer (optional)
@@ -76,23 +86,11 @@ class SystemAudioRecorder: NSObject {
             throw RecordingError.noDisplay
         }
 
-        // --- Audio writer ---
-        let aWriter = try AVAssetWriter(outputURL: audioURL, fileType: .m4a)
-        let aSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC_HE,
-            AVSampleRateKey: 48000,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 48000,
-        ]
-        let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: aSettings)
-        aInput.expectsMediaDataInRealTime = true
-        aWriter.add(aInput)
-        guard aWriter.startWriting() else {
-            throw RecordingError.writerFailed(aWriter.error?.localizedDescription ?? "unknown")
-        }
-        self.audioWriter = aWriter
-        self.audioInput = aInput
-        self.audioSessionStarted = false
+        // The audio file is created on the first buffer, from that buffer's own
+        // format — SCStream's actual output can differ from what we asked for.
+        self.audioFile = nil
+        self.audioWriteErrorCount = 0
+        self.audioFailed = false
 
         // --- Determine capture size ---
         // Use 1x display size (not Retina) — sufficient for call recordings
@@ -230,22 +228,15 @@ class SystemAudioRecorder: NSObject {
         // Small delay to let in-flight buffers drain
         try? await Task.sleep(nanoseconds: 300_000_000)
 
-        // Finalize audio
-        if let aInput = audioInput, let aWriter = audioWriter {
-            if aWriter.status == .writing {
-                aInput.markAsFinished()
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    aWriter.finishWriting {
-                        log("[SystemAudioRecorder] Audio done — status: \(aWriter.status.rawValue)")
-                        cont.resume()
-                    }
-                }
-            } else {
-                log("[SystemAudioRecorder] Audio writer not in writing state: \(aWriter.status.rawValue), error: \(aWriter.error?.localizedDescription ?? "none")")
-            }
+        // Close the audio file on the queue that writes it: releasing it from
+        // another thread could race a buffer still in flight, and AVAudioFile
+        // patches the CAF header (data chunk size) in its deinit — so this also
+        // guarantees the track is properly closed before we return.
+        if let queue = audioQueue {
+            queue.sync { self.audioFile = nil }
+        } else {
+            audioFile = nil
         }
-        audioWriter = nil
-        audioInput = nil
 
         // Finalize video
         if let vInput = videoInput, let vWriter = videoWriter {
@@ -276,18 +267,41 @@ extension SystemAudioRecorder: SCStreamOutput {
 
         switch type {
         case .audio:
-            guard let input = audioInput, input.isReadyForMoreMediaData else { return }
+            guard !audioFailed, let pcm = pcmBuffer(from: sampleBuffer) else { return }
 
-            if !audioSessionStarted {
-                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-                audioWriter?.startSession(atSourceTime: pts)
-                audioSessionStarted = true
-                if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-                   let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-                    log("[SystemAudioRecorder] Audio format: \(asbd.pointee.mSampleRate)Hz, \(asbd.pointee.mChannelsPerFrame)ch, \(asbd.pointee.mBitsPerChannel)bit")
+            if audioFile == nil {
+                do {
+                    audioFile = try AVAudioFile(
+                        forWriting: audioURL,
+                        settings: AudioFormats.pcmSettings(
+                            sampleRate: pcm.format.sampleRate, channels: pcm.format.channelCount),
+                        commonFormat: .pcmFormatFloat32,
+                        interleaved: false
+                    )
+                    log("[SystemAudioRecorder] Audio format: \(Int(pcm.format.sampleRate))Hz, \(pcm.format.channelCount)ch → PCM \(audioURL.lastPathComponent)")
+                } catch {
+                    audioWriteErrorCount += 1
+                    log("[SystemAudioRecorder] ❌ Failed to create audio file (\(audioWriteErrorCount)/\(maxAudioWriteErrors)): \(error.localizedDescription)")
+                    if audioWriteErrorCount >= maxAudioWriteErrors {
+                        log("[SystemAudioRecorder] ❌ Too many file errors — audio track is lost for this session")
+                        audioFailed = true
+                    }
+                    return
                 }
             }
-            input.append(sampleBuffer)
+
+            do {
+                try audioFile?.write(from: pcm)
+                audioWriteErrorCount = 0
+            } catch {
+                audioWriteErrorCount += 1
+                log("[SystemAudioRecorder] ❌ Audio write error (\(audioWriteErrorCount)/\(maxAudioWriteErrors)): \(error.localizedDescription)")
+                if audioWriteErrorCount >= maxAudioWriteErrors {
+                    log("[SystemAudioRecorder] ❌ Too many write errors — stopping audio writes")
+                    audioFailed = true
+                }
+                return
+            }
 
             // Warmup suppresses silence detection for the first non-silent buffer, so the
             // ~30s of digital silence SCStream emits at startup doesn't trigger auto-stop.
@@ -345,6 +359,25 @@ extension SystemAudioRecorder: SCStreamOutput {
         @unknown default:
             break
         }
+    }
+
+    /// Wrap a CMSampleBuffer's samples in an AVAudioPCMBuffer, in the stream's
+    /// own format. Returns nil for a buffer we can't describe or copy, which the
+    /// caller treats as "skip this buffer" rather than as a failure — dropping
+    /// 10 ms of audio is always better than tearing down a live recording.
+    private func pcmBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc),
+              let format = AVAudioFormat(streamDescription: asbd) else { return nil }
+        let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)
+        else { return nil }
+        buffer.frameLength = frames
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer, at: 0, frameCount: Int32(frames), into: buffer.mutableAudioBufferList)
+        guard status == noErr else { return nil }
+        return buffer
     }
 
     /// Compute RMS of a CMSampleBuffer containing float32 audio.
