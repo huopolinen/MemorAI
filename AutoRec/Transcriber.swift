@@ -191,17 +191,21 @@ class Transcriber {
             let fmt = engine.inputFormat
             var fullTranscript = ""
             // Every timed phrase of the call, on the merged file's clock.
-            // Becomes nil the moment one chunk comes back without timings: a
-            // transcript with a ten-minute hole in the middle is worse than an
-            // honest unlabelled one.
+            // Becomes nil the moment one chunk comes back with words it cannot
+            // place: a transcript with a ten-minute hole in the middle is worse
+            // than an honest unlabelled one.
             var timedSegments: [TranscriptSegment]? = []
 
             func absorb(_ result: TranscriptionResult?, chunkOffset: Double) {
                 guard let result else { return }
                 fullTranscript += result.text
                 guard let segments = result.segments else {
+                    // A stretch where nobody said anything has nothing to time,
+                    // and it must not cost the rest of the call its labels —
+                    // only words without times mean the alignment is gone.
+                    guard TranscriptText.hasSpeech(result.text) else { return }
                     if timedSegments != nil {
-                        log("[Transcriber] движок не дал таймкодов для куска — метки говорящих для этой записи отключаю")
+                        log("[Transcriber] движок не дал таймкодов для куска со словами — метки говорящих для этой записи отключаю")
                     }
                     timedSegments = nil
                     return
@@ -231,12 +235,12 @@ class Transcriber {
                        chunkOffset: 0)
                 if segURL != mergedWav { try? FileManager.default.removeItem(at: segURL) }
             } else {
-                let chunks = Int(ceil(duration / chunkSec))
-                log("[Transcriber] [\(sessionTag)] Transcribing \(chunks) chunks (\(Int(duration))s) via \(engine.kind.rawValue)…")
-                for i in 0..<chunks {
-                    let offset = Double(i) * chunkSec
+                let bounds = segmentBounds(of: mergedWav, duration: duration)
+                log("[Transcriber] [\(sessionTag)] Transcribing \(bounds.count) chunks (\(Int(duration))s) via \(engine.kind.rawValue)…")
+                for (i, bound) in bounds.enumerated() {
+                    let offset = bound.offset
                     let segURL = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i).\(fmt.fileExtension)")
-                    guard makeSegment(from: mergedWav, offset: offset, length: chunkSec, format: fmt, to: segURL) else {
+                    guard makeSegment(from: mergedWav, offset: offset, length: bound.length, format: fmt, to: segURL) else {
                         log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) encode failed, skipping")
                         // A missing chunk is a hole in the timeline; whatever
                         // comes after it would be attributed against the wrong
@@ -244,7 +248,7 @@ class Transcriber {
                         timedSegments = nil
                         continue
                     }
-                    log("[Transcriber] [\(sessionTag)]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s…")
+                    log("[Transcriber] [\(sessionTag)]   Chunk \(i+1)/\(bounds.count) @ \(Int(offset))s…")
                     let result = engine.transcribeDetailed(
                         audioURL: segURL, language: SettingsManager.shared.whisperLanguage)
                     if result == nil {
@@ -263,8 +267,10 @@ class Transcriber {
             var cleanedSegments: [TranscriptSegment]?
             if let timedSegments, !timedSegments.isEmpty {
                 // The same hallucination/loop cleanup as the plain path, applied
-                // per segment so the timeline survives it.
-                cleanedSegments = Self.cleanSegments(timedSegments)
+                // per segment so the timeline survives it, and then the dashes
+                // the engine drew where the speaker changed are made into real
+                // segment boundaries — one segment can only carry one label.
+                cleanedSegments = Self.splitOnDialogueDashes(Self.cleanSegments(timedSegments))
                 if let cleanedSegments, !cleanedSegments.isEmpty,
                    let attribution, attribution.hasBothTracks {
                     attributed = attribution.attribute(
@@ -353,14 +359,51 @@ class Transcriber {
         String(format: "%.3f", value)
     }
 
+    /// Where to cut a long recording into engine-sized segments.
+    ///
+    /// Cutting every `chunkSec` on the nose rubs a word in half at every
+    /// boundary — "…пойдём другим юм." on one side, "..ц Мы будем делать новое
+    /// юрлицо…" on the other — and the engine either invents the missing half
+    /// or drops it. `AudioPCM.cutPoints` moves each cut into the quietest
+    /// moment of the seconds before it: the same rule the engines already use
+    /// on the pieces they decode, asked here of the file instead of samples.
+    ///
+    /// Falls back to even cuts if the file cannot be scanned; a boundary in a
+    /// bad place is much better than no transcript.
+    private func segmentBounds(of wav: URL, duration: Double) -> [(offset: Double, length: Double)] {
+        var points: [TimeInterval]
+        do {
+            points = try AudioPCM.cutPoints(of: wav, maxSeconds: chunkSec)
+        } catch {
+            log("[Transcriber] ⚠️ не удалось просмотреть \(wav.lastPathComponent) на паузы"
+                + " (\(error.localizedDescription)) — режу ровно по \(Int(chunkSec)) с")
+            points = []
+        }
+        if points.isEmpty {
+            points = Array(stride(from: chunkSec, to: duration, by: chunkSec))
+        }
+
+        var bounds: [(offset: Double, length: Double)] = []
+        var start: Double = 0
+        for point in points where point > start + minSpeechDuration && point < duration {
+            bounds.append((start, point - start))
+            start = point
+        }
+        bounds.append((start, duration - start))
+        return bounds
+    }
+
     /// Extract/encode a segment of `mergedWav` into `format` at `out`.
     /// `offset`/`length` (seconds) select a sub-range; nil = whole file.
     private func makeSegment(from mergedWav: URL, offset: Double?, length: Double?,
                              format: EngineAudioFormat, to out: URL) -> Bool {
         var args = ["-y"]
-        if let offset = offset { args += ["-ss", String(Int(offset))] }
+        // Fractional: the cuts are snapped to a pause and land on a tenth of a
+        // second, and rounding one off would shift every timestamp in the
+        // chunk — which is several speaker turns' worth of error.
+        if let offset = offset { args += ["-ss", seconds(offset)] }
         args += ["-i", mergedWav.path]
-        if let length = length { args += ["-t", String(Int(length))] }
+        if let length = length { args += ["-t", seconds(length)] }
         args += format.ffmpegEncodeArgs
         args.append(out.path)
         return Subprocess.run(ffmpegPath, args: args).ok
@@ -470,9 +513,98 @@ class Transcriber {
             i += 1
         }
 
-        let removed = lines.count - result.count
+        // Pass 3: one-letter leftovers ("а.", "У.", "."). The decoder emits
+        // them on breaths; a line of them is noise in the file a person reads.
+        let kept = result.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty || !TranscriptText.isNoise(trimmed)
+        }
+
+        let removed = lines.count - kept.count
         if removed > 0 { log("[Transcriber] Dedup: removed \(removed) hallucinated lines") }
-        return result.joined(separator: "\n")
+        return kept.joined(separator: "\n")
+    }
+
+    /// Cut a segment where the engine drew a dialogue dash.
+    ///
+    /// GigaAM writes "—" where the speaker changes — 9 % of segments on one of
+    /// the owner's calls, 17 % on another — so a single segment can read
+    /// "С приложении. — Ну да, на сайте и приложении. — Да-да-да." That is
+    /// three turns of two people, and a segment can only be given one speaker
+    /// label. Splitting it there lets each piece be matched against the track
+    /// that was actually loud under it.
+    ///
+    /// The words inside a segment have no times of their own by this point, so
+    /// the segment's time is shared out by how much of the text each piece
+    /// holds. Speech rate is even enough over a few seconds for that to land
+    /// well within the tenth of a second attribution works at.
+    ///
+    /// The dash stays with the text that follows it: if both pieces turn out to
+    /// be the same speaker after all, the renderer joins them back and the line
+    /// reads exactly as it did before — nothing is lost for a dash that merely
+    /// punctuated a sentence.
+    static func splitOnDialogueDashes(_ segments: [TranscriptSegment]) -> [TranscriptSegment] {
+        var result: [TranscriptSegment] = []
+        var split = 0
+
+        for segment in segments {
+            let pieces = dialoguePieces(of: segment.text)
+            let total = pieces.reduce(0) { $0 + $1.count }
+            guard pieces.count > 1, total > 0 else {
+                result.append(segment)
+                continue
+            }
+
+            let duration = max(0, segment.end - segment.start)
+            var consumed: TimeInterval = 0
+            var made: [TranscriptSegment] = []
+            for piece in pieces {
+                let start = segment.start + consumed
+                consumed += duration * Double(piece.count) / Double(total)
+                let text = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+                // A trailing "—" with nothing after it marks a turn whose words
+                // landed in the next segment; it is not a phrase of its own.
+                guard TranscriptText.hasSpeech(text) else { continue }
+                made.append(TranscriptSegment(start: start, end: segment.start + consumed,
+                                              text: text, speaker: segment.speaker))
+            }
+
+            // Only one piece had words in it — keep the segment as the engine
+            // wrote it, dash and all, rather than quietly editing its text.
+            guard made.count > 1 else {
+                result.append(segment)
+                continue
+            }
+            split += 1
+            result.append(contentsOf: made)
+        }
+
+        if split > 0 {
+            log("[Transcriber] Реплики: по тире разрезано \(split) сегментов"
+                + " → \(result.count - segments.count + split)")
+        }
+        return result
+    }
+
+    /// The segment's text, cut before every dash that stands on its own — one
+    /// with a space in front of it and a space (or the end of the segment)
+    /// behind. That leaves "из-за" and "А-а" alone: those are hyphens inside a
+    /// word, and a hyphen is not this dash to begin with.
+    private static func dialoguePieces(of text: String) -> [String] {
+        let characters = Array(text)
+        var pieces: [String] = []
+        var start = 0
+        for i in characters.indices {
+            let character = characters[i]
+            guard character == "—" || character == "–" else { continue }
+            guard i > start else { continue }  // the piece already starts with one
+            guard i == 0 || characters[i - 1].isWhitespace else { continue }
+            guard i + 1 == characters.count || characters[i + 1].isWhitespace else { continue }
+            pieces.append(String(characters[start..<i]))
+            start = i
+        }
+        pieces.append(String(characters[start...]))
+        return pieces
     }
 
     /// The same cleanup, applied to timed segments instead of lines.

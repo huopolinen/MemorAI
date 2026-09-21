@@ -29,6 +29,24 @@ enum AudioPCM {
     /// engine more than a 10-minute segment, which is ~38 MB of float32 — small
     /// enough that a streaming converter would only buy complexity.
     static func monoFloatSamples(of url: URL) throws -> [Float] {
+        var samples = [Float]()
+        try decodeBlocks(of: url,
+                         estimate: { samples.reserveCapacity($0 + Int(sampleRate)) },
+                         block: { samples.append(contentsOf: $0) })
+        guard !samples.isEmpty else { throw Failure.unreadable(url.lastPathComponent) }
+        return samples
+    }
+
+    /// The decode itself, handing each converted block to `block` instead of
+    /// collecting it. A caller that only needs a summary of the audio (how loud
+    /// it is minute by minute, say) can then read a two-hour file without ever
+    /// holding two hours of float32 — which is half a gigabyte.
+    ///
+    /// `estimate` is called once, before the first block, with the number of
+    /// samples the file is expected to produce.
+    private static func decodeBlocks(of url: URL,
+                                     estimate: (Int) -> Void = { _ in },
+                                     block: (UnsafeBufferPointer<Float>) -> Void) throws {
         let file: AVAudioFile
         do {
             file = try AVAudioFile(forReading: url)
@@ -48,9 +66,7 @@ enum AudioPCM {
                                               frameCapacity: 32_768)
         else { throw Failure.unreadable(url.lastPathComponent) }
 
-        let estimated = Int((Double(file.length) * sampleRate / file.processingFormat.sampleRate).rounded())
-        var samples = [Float]()
-        samples.reserveCapacity(estimated + Int(sampleRate))
+        estimate(Int((Double(file.length) * sampleRate / file.processingFormat.sampleRate).rounded()))
 
         // 10 s of output per conversion pass — big enough to keep the
         // per-call overhead irrelevant, small enough not to spike memory.
@@ -86,59 +102,118 @@ enum AudioPCM {
                 throw Failure.unreadable(url.lastPathComponent)
             }
             if outBuffer.frameLength > 0, let channel = outBuffer.floatChannelData?[0] {
-                samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: Int(outBuffer.frameLength)))
+                block(UnsafeBufferPointer(start: channel, count: Int(outBuffer.frameLength)))
             }
             if status == .endOfStream || status == .error { break }
         }
-
-        guard !samples.isEmpty else { throw Failure.unreadable(url.lastPathComponent) }
-        return samples
     }
+
+    // MARK: - Cutting long audio
+
+    /// A fixed-length cut lands mid-word roughly as often as not, and a word
+    /// cut in half is either invented or dropped by whatever decodes it — the
+    /// damage shows up at every boundary of a long call ("…пойдём другим юм." /
+    /// "..ц Мы будем делать новое юрлицо…"). Snapping the cut to the quietest
+    /// moment nearby puts it in a pause instead, for the cost of one linear
+    /// scan over the audio. Two callers need it: an engine slicing samples it
+    /// has in memory, and `Transcriber` cutting a long recording into segments
+    /// with ffmpeg — so the rule itself lives in `cutWindows`, and both come to
+    /// it through a loudness envelope.
+
+    /// Resolution of that envelope, and so of every cut: 100 ms.
+    private static let cutWindow = Int(sampleRate / 10)
 
     /// Split samples into pieces no longer than `maxSeconds`, cutting at the
     /// quietest moment inside the last `searchSeconds` of each piece.
-    ///
-    /// A fixed-length cut lands mid-word roughly as often as not, and an ASR
-    /// model asked to decode half a word either invents one or drops it — the
-    /// damage shows up at every chunk boundary of a long call. Snapping the cut
-    /// to a local energy minimum puts it in a pause instead, for the cost of one
-    /// linear scan over a few seconds of audio.
     static func chunks(_ samples: [Float], maxSeconds: Double, searchSeconds: Double = 5) -> [ArraySlice<Float>] {
         let maxLen = Int(maxSeconds * sampleRate)
-        guard maxLen > 0 else { return [samples[...]] }
-        let searchLen = min(Int(searchSeconds * sampleRate), maxLen / 2)
+        guard maxLen > cutWindow, samples.count > maxLen else { return [samples[...]] }
+
+        var envelope: [Float] = []
+        envelope.reserveCapacity(samples.count / cutWindow + 1)
+        var i = 0
+        while i < samples.count {
+            let end = min(i + cutWindow, samples.count)
+            envelope.append(loudness(of: samples[i..<end]))
+            i = end
+        }
 
         var result: [ArraySlice<Float>] = []
         var start = 0
-        while start < samples.count {
-            let hardEnd = min(start + maxLen, samples.count)
-            var end = hardEnd
-            if hardEnd < samples.count, searchLen > 0 {
-                end = quietestCut(samples, from: hardEnd - searchLen, to: hardEnd)
-            }
-            if end <= start { end = hardEnd }  // degenerate audio — fall back to the hard cut
+        for cut in cutWindows(envelope, maxSeconds: maxSeconds, searchSeconds: searchSeconds) {
+            let end = min(cut * cutWindow + cutWindow / 2, samples.count)
+            guard end > start else { continue }
             result.append(samples[start..<end])
             start = end
         }
+        if start < samples.count { result.append(samples[start...]) }
         return result
     }
 
-    /// Index of the centre of the lowest-energy 100 ms window in `from..<to`.
-    private static func quietestCut(_ samples: [Float], from: Int, to: Int) -> Int {
-        let window = Int(sampleRate / 10)  // 100 ms
-        guard to - from > window else { return to }
-        var bestIndex = to
-        var bestEnergy = Float.greatestFiniteMagnitude
-        var i = from
-        while i + window <= to {
-            var energy: Float = 0
-            for s in samples[i..<(i + window)] { energy += abs(s) }
-            if energy < bestEnergy {
-                bestEnergy = energy
-                bestIndex = i + window / 2
+    /// The same cuts, as offsets in seconds, for a file that is going to be cut
+    /// by something else (ffmpeg) rather than sliced in memory. Streams the
+    /// decode and keeps only the envelope, so the length of the recording does
+    /// not decide how much memory this costs.
+    ///
+    /// Returns the interior cut points only — never 0 or the end of the file.
+    static func cutPoints(of url: URL, maxSeconds: Double, searchSeconds: Double = 5) throws -> [TimeInterval] {
+        var envelope: [Float] = []
+        var sum: Float = 0
+        var filled = 0
+        try decodeBlocks(of: url) { samples in
+            for sample in samples {
+                sum += abs(sample)
+                filled += 1
+                if filled == cutWindow {
+                    envelope.append(sum / Float(cutWindow))
+                    sum = 0
+                    filled = 0
+                }
             }
-            i += window
         }
-        return bestIndex
+        // A short last window would look quiet just for being short.
+        if filled > 0 { envelope.append(sum / Float(filled)) }
+        guard !envelope.isEmpty else { throw Failure.unreadable(url.lastPathComponent) }
+
+        return cutWindows(envelope, maxSeconds: maxSeconds, searchSeconds: searchSeconds)
+            .map { Double($0 * cutWindow + cutWindow / 2) / sampleRate }
+    }
+
+    /// Mean |sample| — how loud this stretch is, in one number.
+    private static func loudness(of samples: ArraySlice<Float>) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sum: Float = 0
+        for sample in samples { sum += abs(sample) }
+        return sum / Float(samples.count)
+    }
+
+    /// The cut rule, on an envelope of 100 ms loudness values: walk forward at
+    /// most `maxSeconds` at a time, and put each cut in the quietest window of
+    /// the `searchSeconds` before that limit. Returns window indices.
+    private static func cutWindows(_ envelope: [Float],
+                                   maxSeconds: Double,
+                                   searchSeconds: Double) -> [Int] {
+        let maxWindows = max(1, Int(maxSeconds * sampleRate) / cutWindow)
+        let searchWindows = min(Int(searchSeconds * sampleRate) / cutWindow, maxWindows / 2)
+
+        var cuts: [Int] = []
+        var start = 0
+        while start + maxWindows < envelope.count {
+            let hardEnd = start + maxWindows
+            var best = hardEnd
+            var bestLoudness = Float.greatestFiniteMagnitude
+            var i = max(start + 1, hardEnd - searchWindows)
+            while i < hardEnd {
+                if envelope[i] < bestLoudness {
+                    bestLoudness = envelope[i]
+                    best = i
+                }
+                i += 1
+            }
+            if best <= start { best = hardEnd }  // degenerate audio — take the hard cut
+            cuts.append(best)
+            start = best
+        }
+        return cuts
     }
 }

@@ -87,7 +87,7 @@ final class GroqEngine: TranscriptionEngine {
         else { return nil }
 
         guard let items = root["segments"] as? [[String: Any]] else {
-            return TranscriptionResult(text: text, segments: nil)
+            return TranscriptionResult(text: text, segments: untimed(text))
         }
         let segments = items.compactMap { item -> TranscriptSegment? in
             guard let start = (item["start"] as? NSNumber)?.doubleValue,
@@ -98,6 +98,15 @@ final class GroqEngine: TranscriptionEngine {
             guard !trimmed.isEmpty else { return nil }
             return TranscriptSegment(start: start, end: end, text: trimmed)
         }
-        return TranscriptionResult(text: text, segments: segments.isEmpty ? nil : segments)
+        return TranscriptionResult(text: text, segments: segments.isEmpty ? untimed(text) : segments)
+    }
+
+    /// What "no segments came back" means, which depends on whether anything
+    /// was said. Silence has nothing to time, and saying so with an empty list
+    /// keeps the rest of the call's timeline; words without times are a real
+    /// loss of alignment, and nil is the honest answer for those — it costs the
+    /// recording its speaker labels, which is the point.
+    private static func untimed(_ text: String) -> [TranscriptSegment]? {
+        TranscriptText.hasSpeech(text) ? nil : []
     }
 }

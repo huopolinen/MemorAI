@@ -84,10 +84,15 @@ final class GigaAMEngine: TranscriptionEngine {
         let pieces = AudioPCM.chunks(samples, maxSeconds: chunkSeconds)
         var texts: [String] = []
         var segments: [TranscriptSegment] = []
-        // One untimed chunk poisons the whole file: a transcript whose middle
-        //20 seconds have no place on the timeline would be attributed against
-        // the wrong part of the tracks.
+        // One chunk that came back with words and no times poisons the whole
+        // file: a transcript whose middle 20 seconds have no place on the
+        // timeline would be attributed against the wrong part of the tracks.
+        // A chunk with no words in it is a different thing entirely — see
+        // `spoken` below.
         var timed = true
+        // Chunks the runtime refused outright. Their words are gone, so the
+        // result cannot be called complete even though the rest decoded.
+        var failed = 0
         for (index, piece) in pieces.enumerated() {
             guard !piece.isEmpty else { continue }
             // A slice keeps its index in the original array, which is exactly
@@ -107,18 +112,25 @@ final class GigaAMEngine: TranscriptionEngine {
                 log("[GigaAM] ⚠️ chunk \(index + 1)/\(pieces.count) failed: \(Self.message(status))")
                 // The words of this chunk are gone, so anything after it would
                 // sit on a timeline with a hole in it.
+                failed += 1
                 timed = false
                 continue
             }
             guard let raw = transcribe_full_text(session) else { continue }
             let text = String(cString: raw).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { texts.append(text) }
+            // Twenty seconds of a call where nobody spoke come back as "." —
+            // text with not a letter in it. Keeping it would put a line of
+            // punctuation in the transcript, and treating its missing times as
+            // lost alignment would take the speaker labels off the whole call.
+            let spoken = TranscriptText.hasSpeech(text)
+            if spoken { texts.append(text) }
 
-            guard timed else { continue }
+            guard timed, spoken else { continue }
             let chunkSegments = Self.segments(of: session, offset: chunkOffset)
-            if chunkSegments.isEmpty, !text.isEmpty {
+            if chunkSegments.isEmpty {
                 if providesTimestamps {
-                    log("[GigaAM] ⚠️ рантайм не вернул таймкоды — этот транскрипт будет без меток говорящих")
+                    log("[GigaAM] ⚠️ рантайм не вернул таймкоды для куска \(index + 1)/\(pieces.count) со словами"
+                        + " — этот транскрипт будет без меток говорящих")
                 }
                 timed = false
             } else {
@@ -128,7 +140,10 @@ final class GigaAMEngine: TranscriptionEngine {
 
         guard !texts.isEmpty else {
             log("[GigaAM] no speech recognized in \(audioURL.lastPathComponent)")
-            return nil
+            // Silence is not a failure. Said with an empty *result* rather than
+            // nil, the caller keeps the timeline it has built for the rest of
+            // the recording; nil means "this piece is lost" and costs it.
+            return failed > 0 ? nil : TranscriptionResult(text: "", segments: [])
         }
         // One line per chunk: `Transcriber`'s dedup passes work line-wise, and
         // this is the same shape whisper-cli's -otxt output has.
@@ -239,7 +254,7 @@ final class GigaAMEngine: TranscriptionEngine {
                 words.append(Word())
             }
             words[words.count - 1].text += body
-            guard body.rangeOfCharacter(from: .alphanumerics) != nil else { continue }
+            guard TranscriptText.hasSpeech(body) else { continue }
             if words[words.count - 1].start == nil { words[words.count - 1].start = token.start }
             words[words.count - 1].end = token.end
         }
