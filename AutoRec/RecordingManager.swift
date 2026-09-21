@@ -30,6 +30,12 @@ class RecordingManager {
     /// "call_<timestamp>" — names every file of the session and its meta.json.
     private var currentTag: String?
     private var currentDir: URL?
+    /// Real time the session spent paused, and when the open pause began.
+    /// A pause removes wall-clock time from both tracks by design, so the
+    /// end-of-session length check (`TrackSkew`) has to subtract it or it
+    /// would accuse every paused call of being damaged.
+    private var pausedSeconds: TimeInterval = 0
+    private var pausedSince: Date?
 
     @available(macOS 14.4, *)
     private var tapRecorder: CoreAudioTapRecorder? {
@@ -67,6 +73,8 @@ class RecordingManager {
 
         self.currentTag = tag
         self.currentDir = baseDir
+        self.pausedSeconds = 0
+        self.pausedSince = nil
         self.currentMicURL = micURL
         self.currentSystemURL = sysURL
         self.currentScreenURL = vidURL
@@ -209,6 +217,7 @@ class RecordingManager {
         systemAudioRecorder?.isPaused = true
         if #available(macOS 14.4, *) { tapRecorder?.isPaused = true }
         micRecorder?.isPaused = true
+        pausedSince = Date()
         setState(.paused)
         log("[RecordingManager] Paused")
     }
@@ -218,6 +227,7 @@ class RecordingManager {
         systemAudioRecorder?.isPaused = false
         if #available(macOS 14.4, *) { tapRecorder?.isPaused = false }
         micRecorder?.isPaused = false
+        closeOpenPause()
         setState(.recording)
         log("[RecordingManager] Resumed")
     }
@@ -296,15 +306,54 @@ class RecordingManager {
             // process claim is what stops the next launch from treating a
             // finished session as one that was interrupted mid-call; the
             // `stopped` status is what tells it there may still be work to do.
-            SessionMeta.update(tag: tag, in: dir, with: [
+            var fields: [String: Any?] = [
                 "status": SessionMeta.Status.stopped.rawValue,
                 "ended": SessionMeta.iso.string(from: Date()),
                 "stop_reason": source,
                 "pid": nil,
                 "pid_started": nil,
-            ])
+            ]
+            // Now that the files are closed and their lengths are final, ask
+            // whether they are as long as the call was.
+            for (key, value) in trackAudit(tag: tag, in: dir, session: session) {
+                fields[key] = value
+            }
+            SessionMeta.update(tag: tag, in: dir, with: fields)
         }
         return session
+    }
+
+    /// Length of every track against the length of the session — see
+    /// `TrackSkew` for why this is worth doing at all.
+    ///
+    /// The session's start comes from its own marker rather than a field kept
+    /// here: the marker is what survives a crash, so recovery and a clean stop
+    /// answer this question from the same number.
+    private func trackAudit(
+        tag: String, in dir: URL, session: FinishedSession
+    ) -> [String: Any] {
+        closeOpenPause()
+        let paused = pausedSeconds
+        pausedSeconds = 0
+        guard let started = (SessionMeta.read(tag: tag, in: dir)?["started"] as? String)
+            .flatMap({ SessionMeta.iso.date(from: $0) })
+        else { return [:] }
+
+        var tracks: [String: URL] = [:]
+        if let mic = session.mic { tracks["mic"] = mic }
+        if let system = session.system { tracks["system"] = system }
+        return TrackSkew.audit(
+            tag: tag,
+            sessionSeconds: Date().timeIntervalSince(started) - paused,
+            tracks: tracks)
+    }
+
+    /// Add an in-progress pause to the running total. Idempotent, because a
+    /// session can be stopped straight out of the paused state.
+    private func closeOpenPause() {
+        guard let since = pausedSince else { return }
+        pausedSeconds += Date().timeIntervalSince(since)
+        pausedSince = nil
     }
 
     /// Mux, transcribe, and — only if a transcript came out of it — archive.
