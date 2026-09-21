@@ -180,6 +180,267 @@ if stuck:
 PYEOF
 }
 
+# Find — and, on demand, repair — calls whose microphone track was recorded at
+# the wrong speed.
+#
+# The damage: until 1.5.2 the mic file's sample rate was fixed by the first
+# device of the session, and a device change mid-call (AirPods dropping to
+# their 24 kHz voice mode) fed the new device's samples into it unconverted.
+# The owner's half of such a call plays at double speed and transcribes as
+# noise. 114 of 370 archived calls are affected.
+#
+# The repair is exact rather than approximate: the samples on disk are intact,
+# only the rate they are labelled with is wrong, so re-labelling the affected
+# span (asetrate) and resampling back undoes the damage sample for sample. A
+# blanket atempo would instead time-stretch, and would be wrong for the calls
+# where the device changed partway through — most of the file is fine there.
+#
+# Nothing is overwritten, ever: the result is a new `_mic_repaired.m4a` beside
+# the original, which is the only copy of the conversation.
+cmd_repair_speed() {
+    local output apply=0 only_tag=""
+    output=$(get_output_path)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fix) apply=1 ;;
+            --dir) output="$2"; shift ;;
+            --tag) only_tag="$2"; shift ;;
+            *) echo "Usage: memorai repair-speed [--fix] [--dir <folder>] [--tag <call_…>]"; return 1 ;;
+        esac
+        shift
+    done
+    if [ "$apply" = "1" ] && ! command -v ffmpeg > /dev/null 2>&1; then
+        echo "ffmpeg is required to repair (brew install ffmpeg)"
+        return 1
+    fi
+    python3 - "$output" "$apply" "$only_tag" << 'PYEOF'
+import glob, os, re, subprocess, sys
+from datetime import datetime, timezone
+
+folder, apply, only_tag = sys.argv[1], sys.argv[2] == "1", sys.argv[3]
+
+# A call shorter than this is not worth guessing about: a second of device
+# warm-up is a large share of it, and half of it is not much to recover.
+MIN_SYSTEM_SECONDS = 30.0
+# mic/system below this is not a rounding difference. Measured over the 405
+# archived calls with both tracks: healthy ones cluster at 0.95–1.05, damaged
+# ones below 0.70, and the band 0.85–0.95 is empty.
+SUSPECT_SHARE = 0.85
+# Without log evidence, only a track that is half the far end's length end to
+# end is repaired — that ratio has one plausible cause. Anything between the
+# two clusters needs a human, because "the engine died halfway" looks the same
+# from the outside and slowing it down would ruin it.
+FLAT_LOW, FLAT_HIGH = 0.45, 0.55
+# How far the length the log predicts may sit from the length on disk before we
+# stop believing the log explains this file. The gap of a restart (a fraction
+# of a second, unpadded before 1.6) and the log's one-second timestamps are the
+# whole of the expected error.
+LOG_TOLERANCE = 0.05
+
+
+def probe(path, entries):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", entries,
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=60)
+        return out.stdout.split()
+    except Exception:
+        return []
+
+
+def duration(path):
+    values = probe(path, "format=duration")
+    return float(values[0]) if values else None
+
+
+def file_rate(path):
+    """The sample rate the track's own header declares — which is the one the
+    audio is *played* at, and therefore the one the damage is measured against.
+    Read from the file rather than the log because the two disagree exactly
+    where it matters: 1.4.0/1.4.1 hardcoded the file at 48 kHz no matter what
+    the engine was capturing."""
+    values = probe(path, "stream=sample_rate")
+    return int(values[0]) if values else None
+
+
+def track(tag, role):
+    for ext in ("caf", "m4a"):
+        path = os.path.join(folder, f"{tag}_{role}.{ext}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+# --- What the log knows -----------------------------------------------------
+#
+# Every session's mic engine announces the format it is capturing in, both when
+# it starts and on every restart. That is the whole story of this bug written
+# down: the first rate is the one the file's header got, and any later rate is
+# a span that went in mislabelled.
+STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z ")
+STARTED = re.compile(r"\[MicRecorder\] Recording started → (call_\S+?)_mic\.")
+# The line has been worded four ways across the versions that wrote this
+# archive, and every one of them states the rate the engine is capturing at
+# first: "Engine started: 24000Hz, 1ch", "…: input 24000Hz/1ch → file
+# 48000Hz/1ch", "…: probe 48000Hz/1ch", "Engine started on <device>:
+# 48000Hz/1ch".
+ENGINE = re.compile(r"\[MicRecorder\] Engine started[^:]*:\s*(?:probe\s+|input\s+)?(\d+)\s*Hz")
+STOPPED = re.compile(r"\[MicRecorder\] Recording stopped")
+
+
+def parse_log():
+    path = os.path.join(folder, "memorai.log")
+    sessions, open_tag, segments, pending = {}, None, [], None
+    if not os.path.exists(path):
+        return sessions
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            stamp = STAMP.match(line)
+            if not stamp:
+                continue
+            when = datetime.strptime(stamp.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            engine = ENGINE.search(line)
+            if engine:
+                entry = (when, int(engine.group(1)))
+                if open_tag:
+                    segments.append(entry)
+                else:
+                    # The start-up line lands just before "Recording started".
+                    pending = entry
+                continue
+            start = STARTED.search(line)
+            if start:
+                open_tag = start.group(1)
+                segments = [pending] if pending else []
+                pending = None
+                continue
+            if STOPPED.search(line) and open_tag:
+                if segments:
+                    sessions[open_tag] = (segments, when)
+                open_tag, segments = None, []
+    return sessions
+
+
+def plan_from_log(entry, mic_seconds, rate_on_disk):
+    """File-time spans and the rate each was really captured at, or None."""
+    segments, ended = entry
+    bounds, at = [], 0.0
+    for i, (when, rate) in enumerate(segments):
+        until = segments[i + 1][0] if i + 1 < len(segments) else ended
+        real = (until - when).total_seconds()
+        if real <= 0:
+            continue
+        span = real * rate / rate_on_disk
+        bounds.append((at, at + span, rate))
+        at += span
+    if not bounds or at <= 0:
+        return None
+    if abs(at - mic_seconds) / mic_seconds > LOG_TOLERANCE:
+        return None          # the log does not describe the file on disk
+    if all(rate == rate_on_disk for _, _, rate in bounds):
+        return None          # nothing was mislabelled; the track is short for another reason
+    # The last span ends where the audio ends, whatever the arithmetic says.
+    bounds[-1] = (bounds[-1][0], mic_seconds, bounds[-1][2])
+    return bounds
+
+
+def repair(src, dst, file_rate, bounds):
+    chains, labels = [], []
+    for i, (start, end, rate) in enumerate(bounds):
+        chain = f"[0:a]atrim={start:.4f}:{end:.4f},asetpts=N/SR/TB"
+        if rate != file_rate:
+            # The samples are fine; only the rate they were filed under is
+            # wrong. Re-label, then resample back to the file's rate.
+            chain += f",asetrate={rate},aresample={file_rate}"
+        chains.append(chain + f"[p{i}]")
+        labels.append(f"[p{i}]")
+    graph = ";".join(chains) + ";" + "".join(labels) + f"concat=n={len(bounds)}:v=0:a=1[out]"
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-i", src,
+           "-filter_complex", graph, "-map", "[out]",
+           "-c:a", "aac", "-b:a", "64k", dst]
+    done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if done.returncode != 0:
+        if os.path.exists(dst):
+            os.remove(dst)
+        return done.stderr.strip().splitlines()[-1] if done.stderr.strip() else "ffmpeg failed"
+    return None
+
+
+log_sessions = parse_log()
+tags = sorted({
+    os.path.basename(p).rsplit("_mic.", 1)[0]
+    for ext in ("caf", "m4a")
+    for p in glob.glob(os.path.join(folder, f"call_*_mic.{ext}"))
+})
+if only_tag:
+    tags = [t for t in tags if t == only_tag]
+
+found, repaired, skipped, recovered = [], 0, [], 0.0
+for tag in tags:
+    mic, system = track(tag, "mic"), track(tag, "system")
+    if not mic or not system:
+        continue                     # one-sided recording: nothing to compare against
+    mic_seconds, system_seconds = duration(mic), duration(system)
+    if not mic_seconds or not system_seconds or system_seconds < MIN_SYSTEM_SECONDS:
+        continue
+    share = mic_seconds / system_seconds
+    if share >= SUSPECT_SHARE:
+        continue
+
+    rate = file_rate(mic)
+    bounds = (plan_from_log(log_sessions[tag], mic_seconds, rate)
+              if tag in log_sessions and rate else None)
+    if bounds:
+        rates = "→".join(str(r) for _, _, r in bounds)
+        why = f"log: captured at {rates} Hz, filed as {rate} Hz"
+    elif rate and FLAT_LOW <= share <= FLAT_HIGH:
+        bounds = [(0.0, mic_seconds, rate // 2)]
+        why = "no usable log entry — inferred from the 2:1 length ratio alone"
+    else:
+        skipped.append((tag, share, "length ratio is off but nothing explains it — look at this one by hand"))
+        continue
+
+    dst = os.path.join(folder, f"{tag}_mic_repaired.m4a")
+    transcript = os.path.join(folder, f"{tag}_transcript.txt")
+    note = "transcript exists (left alone)" if os.path.exists(transcript) else "no transcript"
+    if os.path.exists(dst):
+        skipped.append((tag, share, "already repaired — " + os.path.basename(dst) + " is there"))
+        continue
+
+    found.append((tag, mic_seconds, system_seconds, share, why, note))
+    if apply:
+        error = repair(mic, dst, rate, bounds)
+        if error:
+            print(f"  ❌ {tag}: {error}")
+        else:
+            repaired += 1
+            recovered += (duration(dst) or 0) - mic_seconds
+
+print(f"=== Mic tracks recorded at the wrong speed ({folder}) ===")
+if not found and not skipped:
+    print("Nothing suspicious: every call's mic track matches the far end's length.")
+for tag, mic_s, sys_s, share, why, note in found:
+    print(f"  {tag}  mic {mic_s/60:6.1f}m vs far end {sys_s/60:6.1f}m  ({share:.2f}×)")
+    print(f"      {why}; {note}")
+    print(f"      → {tag}_mic_repaired.m4a")
+if skipped:
+    print()
+    print("Left alone:")
+    for tag, share, why in skipped:
+        print(f"  {tag}  ({share:.2f}×)  {why}")
+print()
+if apply:
+    print(f"Repaired {repaired} of {len(found)}; "
+          f"{recovered/60:.0f} minutes of speech given their real length back.")
+    print("Originals untouched. Transcripts untouched — re-run transcription yourself")
+    print("if you want the repaired tracks turned into text.")
+else:
+    print(f"{len(found)} call(s) would be repaired. Nothing has been changed.")
+    print("Run  memorai repair-speed --fix  to write the repaired tracks.")
+PYEOF
+}
+
 cmd_screenshots() {
     local output=$(get_output_path)
     local today=$(date +%Y-%m-%d)
@@ -476,6 +737,11 @@ Commands:
   restart                   Restart MemorAI
 
   sessions                  List call sessions and their processing state
+  repair-speed [--fix]      Find calls whose mic track was recorded at double
+                            speed (device changed mid-call) and, with --fix,
+                            write a corrected copy beside each original
+    --dir <folder>          Look somewhere other than the recordings folder
+    --tag call_<timestamp>  Only this one session
   screenshots [date]        List today's screenshots (or given YYYY-MM-DD)
   clipboard [count]         Show clipboard history (default: last 20)
   ocr [date] [count]        Show OCR text from screenshots
@@ -506,6 +772,7 @@ case "${1:-help}" in
     stop)         cmd_stop ;;
     restart)      cmd_restart ;;
     sessions)     cmd_sessions ;;
+    repair-speed) shift; cmd_repair_speed "$@" ;;
     screenshots)  cmd_screenshots "$2" ;;
     clipboard)    cmd_clipboard "$2" ;;
     ocr)          cmd_ocr "$2" "$3" ;;
