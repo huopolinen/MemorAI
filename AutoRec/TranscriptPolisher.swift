@@ -24,7 +24,10 @@ enum TranscriptPolisher {
     /// them alone and the result is checked before it is accepted.
     static func polish(_ text: String, apiKey: String, speakerLabels: Bool = false) -> String? {
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return nil }
+        guard !key.isEmpty else {
+            log("[Polisher] нет ключа Groq — оставляю сырой текст")
+            return nil
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
@@ -94,7 +97,10 @@ enum TranscriptPolisher {
                 ["role": "user", "content": chunk],
             ],
         ]
-        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+            log("[Polisher] не собрался запрос (\(chunk.count) символов)")
+            return nil
+        }
 
         var req = URLRequest(url: endpoint)
         req.httpMethod = "POST"
@@ -104,19 +110,48 @@ enum TranscriptPolisher {
         req.timeoutInterval = 120
 
         let (data, response, error) = HTTP.sendSyncRetrying(req)
-        if let error = error { log("[Polisher] network error: \(error.localizedDescription)"); return nil }
+        if let error = error {
+            let ns = error as NSError
+            log("[Polisher] сеть: \(error.localizedDescription) [\(ns.domain) \(ns.code)]")
+            return nil
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200, let data = data else {
             let b = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
             log("[Polisher] HTTP \(status): \(b.prefix(300))")
             return nil
         }
+        // Every exit below used to return nil without a word, which is how a
+        // run of failed polishes ended up in the log with no cause at all.
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = root["choices"] as? [[String: Any]],
-              let msg = choices.first?["message"] as? [String: Any],
-              let content = msg["content"] as? String else { return nil }
+              let choices = root["choices"] as? [[String: Any]], let first = choices.first
+        else {
+            log("[Polisher] ответ не разобран: \(bodyPreview(data))")
+            return nil
+        }
+        let finish = (first["finish_reason"] as? String) ?? "?"
+        guard let msg = first["message"] as? [String: Any],
+              let content = msg["content"] as? String
+        else {
+            log("[Polisher] в ответе нет текста (finish_reason: \(finish)): \(bodyPreview(data))")
+            return nil
+        }
         let result = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return result.isEmpty ? nil : result
+        guard !result.isEmpty else {
+            // A reasoning model can spend the whole budget on its own thinking
+            // and answer with an empty string — `finish_reason` says which.
+            log("[Polisher] пустой ответ модели (finish_reason: \(finish), чанк \(chunk.count) символов)")
+            return nil
+        }
+        return result
+    }
+
+    /// First 300 characters of a response body, for the log.
+    private static func bodyPreview(_ data: Data) -> String {
+        guard let body = String(data: data, encoding: .utf8) else {
+            return "<не UTF-8, \(data.count) байт>"
+        }
+        return String(body.prefix(300))
     }
 
     /// Split on whitespace into chunks of ~perChunk words, breaking at a sentence
