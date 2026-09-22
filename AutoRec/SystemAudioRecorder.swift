@@ -49,6 +49,12 @@ class SystemAudioRecorder: NSObject {
     private var videoQueue: DispatchQueue?
 
     private var isRecording = false
+    /// Set when SCStream died on its own instead of being stopped by us. The
+    /// stream is gone and `isRecording` is already false, but the video writer
+    /// still holds every frame appended so far in an unfinalized mp4 — without
+    /// this flag `stop()` returns at its guard and the file is left with no
+    /// moov atom, i.e. unreadable. See `didStopWithError`.
+    private var needsFinalize = false
     var isPaused = false
 
     // --- Silence detection ---
@@ -228,8 +234,9 @@ class SystemAudioRecorder: NSObject {
     }
 
     func stop() async {
-        guard isRecording else { return }
+        guard isRecording || needsFinalize else { return }
         isRecording = false
+        needsFinalize = false
 
         warmupTimer?.cancel()
         warmupTimer = nil
@@ -450,6 +457,10 @@ extension SystemAudioRecorder: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("[SystemAudioRecorder] Stream stopped with error: \(error)")
         isRecording = false
+        // The frames already appended are only readable once the writer has
+        // written its moov atom, and the audio file's header is patched when it
+        // is closed, so the teardown in `stop()` still has to run.
+        needsFinalize = true
         warmupTimer?.cancel()
         warmupTimer = nil
         DispatchQueue.main.async { [weak self] in
