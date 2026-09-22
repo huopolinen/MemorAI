@@ -138,9 +138,16 @@ class RecordingManager {
                         audioURL: tapStarted ? nil : sysURL, videoURL: vidURL)
                     if tapStarted {
                         // Video-only stream: its death must not take the
-                        // (separate, still healthy) audio capture with it.
-                        sysRec.onStreamError = { error in
-                            log("[RecordingManager] ⚠️ Видео экрана остановилось: \(error.localizedDescription) — звук продолжает писаться")
+                        // (separate, still healthy) audio capture with it. The
+                        // call keeps running as one session; only the screen
+                        // half is shut down — right here rather than at the end
+                        // of the call, so the frames taken before the crash are
+                        // closed into a playable mp4 within seconds instead of
+                        // sitting unfinalized for the next hour.
+                        sysRec.onStreamError = { [weak sysRec] error in
+                            log("[RecordingManager] ⚠️ Видео экрана остановилось: \(error.localizedDescription) — звук продолжает писаться, закрываю видеофайл")
+                            guard let sysRec else { return }
+                            Task { await sysRec.stop() }
                         }
                     } else {
                         // Wire up silence / availability / error signals
