@@ -461,6 +461,9 @@ extension SystemAudioRecorder: SCStreamDelegate {
         // written its moov atom, and the audio file's header is patched when it
         // is closed, so the teardown in `stop()` still has to run.
         needsFinalize = true
+        // Drop the dead stream here: `stop()` must not spend the session's
+        // teardown asking a stream that already stopped itself to stop.
+        self.stream = nil
         warmupTimer?.cancel()
         warmupTimer = nil
         DispatchQueue.main.async { [weak self] in
