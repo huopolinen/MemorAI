@@ -95,8 +95,17 @@ class CallDetector {
 
     // MARK: - Poll
 
+    /// Dictation tools already reported as holding the mic, so each capture
+    /// is logged once rather than every poll.
+    private var reportedDictation = Set<pid_t>()
+
     private func checkStatus() {
-        let foreign = AudioProcesses.micHolders()
+        // Dictation (Claude Code voice input, macOS dictation…) is split off
+        // here: it neither starts a call nor keeps a real one alive after the
+        // call app lets go of the mic.
+        let capture = AudioProcesses.micCapture()
+        reportDictation(capture.dictation)
+        let foreign = capture.calls
         let inCall = !foreign.isEmpty
 
         if inCall {
@@ -122,5 +131,13 @@ class CallDetector {
             log("[CallDetector] \(recordingMode ? "No other process holds mic" : "Mic released") — call ended")
             onCallEnded?()
         }
+    }
+
+    private func reportDictation(_ holders: [AudioProcesses.Process]) {
+        let current = Set(holders.map { $0.pid })
+        for holder in holders where !reportedDictation.contains(holder.pid) {
+            log("[CallDetector] Mic captured by \(holder.label) — диктовка, не звонок, пропускаю")
+        }
+        reportedDictation = current
     }
 }

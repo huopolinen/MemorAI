@@ -146,6 +146,16 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "excludedBundleIds") }
     }
 
+    /// Extra dictation tools whose use of the microphone is not a call, on
+    /// top of the built-in list in `AudioProcesses` (Claude Code, Claude
+    /// Desktop, macOS dictation, Siri). Each entry is a bundle-id prefix, an
+    /// exact process name or a fragment of the executable path. No UI:
+    /// `defaults write <bundle id> extraDictationApps -array "…"`.
+    var extraDictationApps: [String] {
+        get { defaults.stringArray(forKey: "extraDictationApps") ?? [] }
+        set { defaults.set(newValue, forKey: "extraDictationApps") }
+    }
+
     // MARK: - Transcription Engine
 
     /// Selected transcription backend. See `TranscriptionEngineKind`.

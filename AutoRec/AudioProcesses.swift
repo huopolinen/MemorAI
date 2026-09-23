@@ -66,7 +66,87 @@ enum AudioProcesses {
     /// `CallDetector` turns into "a call is happening", and the seed the tap
     /// uses to work out *which app* the call belongs to.
     static func micHolders() -> [Process] {
-        all().filter { $0.runningInput && isUserFacing(pid: $0.pid) }
+        micCapture().calls
+    }
+
+    /// Everyone capturing the microphone, split in two: apps that may be on a
+    /// call, and dictation tools that only listen to the user for a moment
+    /// (Claude Code's voice input, Claude Desktop, macOS dictation / Siri).
+    /// Dictation never counts as a call — neither for starting one, nor for
+    /// keeping one alive, nor for choosing whose sound the tap records.
+    static func micCapture() -> (calls: [Process], dictation: [Process]) {
+        let extra = SettingsManager.shared.extraDictationApps
+        var calls: [Process] = []
+        var dictation: [Process] = []
+        for process in all() where process.runningInput && isUserFacing(pid: process.pid) {
+            let path = executablePath(pid: process.pid) ?? ""
+            if isDictation(process, path: path, extra: extra) {
+                dictation.append(process)
+            } else {
+                calls.append(process)
+            }
+        }
+        return (calls, dictation)
+    }
+
+    // MARK: - Dictation
+
+    /// Bundle-id prefixes of dictation tools. Claude Code ships its CLI inside
+    /// `ClaudeCode.app`, which CoreAudio may report under its own id.
+    static let dictationBundlePrefixes = [
+        "com.anthropic.claudefordesktop",
+        "com.anthropic.claude-code",
+        "com.apple.SpeechRecognitionCore",
+        "com.apple.DictationIM",
+        "com.apple.inputmethod.ironwood",   // DictationIM's own bundle id
+        "com.apple.corespeech",
+        "com.apple.assistant",
+        "com.apple.siri",
+    ]
+
+    /// Fragments of the executable path. The Claude Code CLI has no bundle id
+    /// for AppKit and its executable is named after its version
+    /// (`~/.local/share/claude/versions/2.1.280`), so the path is the only
+    /// reliable sign of it.
+    static let dictationPathFragments = [
+        "/.local/share/claude/",
+        "/claude/versions/",
+        "/Claude.app/",
+    ]
+
+    /// Exact executable / display names — mostly system daemons, which
+    /// `isUserFacing` already drops by their /System path; listed so they are
+    /// still recognised if one ever runs from elsewhere.
+    static let dictationNames = [
+        "DictationIM",
+        "corespeechd",
+        "SpeechRecognitionCore",
+        "com.apple.SpeechRecognitionCore",
+        "assistantd",
+        "Siri",
+    ]
+
+    /// Whether a mic holder is a dictation tool rather than a call app.
+    ///
+    /// `extra` comes from the `extraDictationApps` setting: each entry matches
+    /// a bundle-id prefix, an exact name, or a fragment of the executable path
+    /// — whichever it happens to be.
+    static func isDictation(_ process: Process, path: String, extra: [String] = []) -> Bool {
+        let bundleID = process.bundleID
+        if !bundleID.isEmpty,
+           dictationBundlePrefixes.contains(where: { bundleID.hasPrefix($0) }) {
+            return true
+        }
+        if dictationNames.contains(process.name) { return true }
+        if !path.isEmpty, dictationPathFragments.contains(where: { path.contains($0) }) {
+            return true
+        }
+        for entry in extra where !entry.isEmpty {
+            if !bundleID.isEmpty && bundleID.hasPrefix(entry) { return true }
+            if process.name == entry { return true }
+            if !path.isEmpty && path.contains(entry) { return true }
+        }
+        return false
     }
 
     /// Our own audio process object, so a global tap can exclude it — the
