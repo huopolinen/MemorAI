@@ -49,6 +49,33 @@ class SystemAudioRecorder: NSObject {
     private var videoQueue: DispatchQueue?
 
     private var isRecording = false
+    /// True from `start()` until `stop()` begins: the files of this session are
+    /// ours and a dead stream may still be replaced. A restart that finishes
+    /// after `stop()` has begun must not bring a stream back to life.
+    private var sessionActive = false
+    /// What the first stream was built from, so a restarted one captures the
+    /// same display at the same size — the video writer's dimensions are fixed
+    /// at its first frame, and a restart must not change them under it.
+    private var streamConfig: SCStreamConfiguration?
+    private var displayID: CGDirectDisplayID?
+    /// When the first stream started capturing: the zero of this track's
+    /// timeline, and of the mic's, which starts right after it.
+    private var streamStartedAt: Date?
+
+    // --- Timeline across stream restarts ---
+    // A restarted stream picks up minutes of wall-clock time later than the
+    // last buffer of the dead one. The mic never stopped, so unless the hole
+    // is filled the far end slides earlier by the whole outage and every
+    // later reply lands against the wrong words. These are touched only on
+    // the audio queue.
+    /// End of the last buffer written (or skipped by a pause), in the
+    /// stream's own clock.
+    private var lastAudioEnd: CMTime = .invalid
+    /// Wall-clock moment that last buffer was handled.
+    private var lastAudioWall: Date?
+    /// Set by `restartStream()`: the next buffer is the first of a new stream,
+    /// and the gap before it has to be written as silence.
+    private var fillGapOnNextBuffer = false
     /// Set when SCStream died on its own instead of being stopped by us. The
     /// stream is gone and `isRecording` is already false, but the video writer
     /// still holds every frame appended so far in an unfinalized mp4 — without
@@ -64,8 +91,9 @@ class SystemAudioRecorder: NSObject {
     /// Fires once per session if system audio never produced a non-silent buffer within
     /// warmupTimeout seconds — signals the session is mic-only (voice memo, headphone-only call).
     var onSystemAudioUnavailable: (() -> Void)?
-    /// Fires if SCStream terminates with an error so the session can be stopped cleanly
-    /// instead of leaving the mic recording into a dead file.
+    /// Fires (on main) when SCStream terminates on its own. The files stay
+    /// open: the owner decides whether to `restartStream()` into them or to
+    /// `stop()` and close them.
     var onStreamError: ((Error) -> Void)?
     private let silenceRMSThreshold: Float = 0.001
     private let silenceDurationThreshold: TimeInterval = 90.0
@@ -144,23 +172,24 @@ class SystemAudioRecorder: NSObject {
         // Video writer is created lazily on first frame to ensure dimensions match
         self.videoFailed = false
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
-
         if recordAudio {
-            let aQueue = DispatchQueue(label: "autorec.audio", qos: .userInitiated)
-            self.audioQueue = aQueue
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: aQueue)
+            self.audioQueue = DispatchQueue(label: "autorec.audio", qos: .userInitiated)
         }
-
         if recordScreen {
-            let vQueue = DispatchQueue(label: "autorec.video", qos: .userInitiated)
-            self.videoQueue = vQueue
-            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: vQueue)
+            self.videoQueue = DispatchQueue(label: "autorec.video", qos: .userInitiated)
         }
+        self.streamConfig = config
+        self.displayID = display.displayID
+        self.lastAudioEnd = .invalid
+        self.lastAudioWall = nil
+        self.fillGapOnNextBuffer = false
+        self.needsFinalize = false
 
+        let stream = try makeStream(display: display, config: config)
         self.stream = stream
         try await stream.startCapture()
+        streamStartedAt = Date()
+        sessionActive = true
         isRecording = true
 
         // No audio track, nothing to time out on: the mic-only signal belongs
@@ -168,6 +197,121 @@ class SystemAudioRecorder: NSObject {
         if recordAudio { startWarmupTimer() }
 
         log("[SystemAudioRecorder] Started — audio: \(audioURL?.lastPathComponent ?? "off"), video: \(videoURL?.lastPathComponent ?? "off")")
+    }
+
+    /// A new SCStream over `display`, wired to this recorder's outputs and
+    /// queues. The queues outlive any one stream, so buffers of a restarted
+    /// stream are written by the same queue that wrote the dead one's.
+    private func makeStream(display: SCDisplay, config: SCStreamConfiguration) throws -> SCStream {
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        if let audioQueue {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        }
+        if let videoQueue {
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
+        }
+        return stream
+    }
+
+    /// Whether the capture stream is currently delivering (as opposed to dead
+    /// and waiting for `restartStream()`).
+    var isStreamAlive: Bool { isRecording && stream != nil }
+
+    /// Bring capture back after the system stopped the stream, into the same
+    /// files.
+    ///
+    /// Nothing about the session changes: the audio file stays open and the
+    /// gap is written into it as silence when the first new buffer arrives
+    /// (see `fillGap`), and the video writer keeps its session — the new
+    /// frames simply carry later timestamps, so the outage plays back as the
+    /// last frame held still. Throws when the stream cannot be started; the
+    /// caller decides whether to try again.
+    func restartStream() async throws {
+        guard sessionActive, !isStreamAlive, let config = streamConfig else { return }
+
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        guard sessionActive else { return }
+        // The same display if it is still there; the first one otherwise (the
+        // config's fixed size scales whatever it is to the writer's size).
+        guard let display = content.displays.first(where: { $0.displayID == displayID })
+            ?? content.displays.first
+        else { throw RecordingError.noDisplay }
+
+        if let audioQueue {
+            audioQueue.sync { self.fillGapOnNextBuffer = true }
+        }
+        let stream = try makeStream(display: display, config: config)
+        self.stream = stream
+        do {
+            try await stream.startCapture()
+        } catch {
+            if self.stream === stream { self.stream = nil }
+            throw error
+        }
+        guard sessionActive else {
+            // `stop()` ran while we were starting — it owns the files now and
+            // this stream must not feed them.
+            try? await stream.stopCapture()
+            if self.stream === stream { self.stream = nil }
+            return
+        }
+        isRecording = true
+        log("[SystemAudioRecorder] Stream restarted — дописываю в те же файлы (\(audioURL?.lastPathComponent ?? "без звука"), \(videoURL?.lastPathComponent ?? "без видео"))")
+    }
+
+    /// Write the stretch of the call the far-end track missed as silence, so
+    /// the track stays as long as the call and aligned with the mic.
+    ///
+    /// The gap is measured in the stream's own clock when that clock agrees
+    /// with the wall clock, and by the wall clock otherwise: SCStream stamps
+    /// buffers in host time, but a restarted stream is a new object and a
+    /// wrong guess here would shift the rest of the call, so the plainer
+    /// number wins whenever the two disagree by more than a moment.
+    /// Runs on the audio queue.
+    private func fillGap(beforePTS pts: CMTime?, file: AVAudioFile, reason: String) {
+        let now = Date()
+        var gap: Double
+        if let wall = lastAudioWall {
+            let wallGap = now.timeIntervalSince(wall)
+            gap = wallGap
+            if let pts, lastAudioEnd.isValid, pts.isValid {
+                let ptsGap = CMTimeSubtract(pts, lastAudioEnd).seconds
+                if ptsGap.isFinite, ptsGap >= 0, abs(ptsGap - wallGap) < 2 { gap = ptsGap }
+            }
+        } else if let started = streamStartedAt {
+            // No buffer was ever written: the track starts late by however
+            // long it took the stream to come back.
+            gap = now.timeIntervalSince(started)
+        } else {
+            return
+        }
+        // A few hundredths are ordinary delivery jitter, not an outage.
+        guard gap >= 0.05 else { return }
+        gap = min(gap, 6 * 3600)
+
+        let format = file.processingFormat
+        let rate = format.sampleRate
+        var remaining = AVAudioFramePosition(gap * rate)
+        let chunk = AVAudioFrameCount(rate)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunk) else { return }
+        if let channels = buffer.floatChannelData {
+            for ch in 0..<Int(format.channelCount) {
+                channels[ch].update(repeating: 0, count: Int(chunk))
+            }
+        }
+        do {
+            while remaining > 0 {
+                buffer.frameLength = AVAudioFrameCount(min(AVAudioFramePosition(chunk), remaining))
+                try file.write(from: buffer)
+                remaining -= AVAudioFramePosition(buffer.frameLength)
+            }
+            log(String(format: "[SystemAudioRecorder] Пропуск %.1f с (%@) заполнен тишиной — дорожка идёт вровень с микрофоном", gap, reason))
+        } catch {
+            log("[SystemAudioRecorder] ❌ Не удалось дописать тишину за пропуск: \(error.localizedDescription)")
+        }
+        lastAudioWall = now
+        if let pts, pts.isValid { lastAudioEnd = pts }
     }
 
     /// Arm a one-shot timer: if no non-silent audio buffer arrives in `warmupTimeout` seconds,
@@ -235,6 +379,11 @@ class SystemAudioRecorder: NSObject {
 
     func stop() async {
         guard isRecording || needsFinalize else { return }
+        // Nobody may restart the stream from here on.
+        sessionActive = false
+        // Dead at the moment the call ends: the far end has been silent since
+        // the stream died, and the track has to say so for its full length.
+        let endedWhileDead = !isRecording
         isRecording = false
         needsFinalize = false
 
@@ -255,10 +404,16 @@ class SystemAudioRecorder: NSObject {
         // another thread could race a buffer still in flight, and AVAudioFile
         // patches the CAF header (data chunk size) in its deinit — so this also
         // guarantees the track is properly closed before we return.
+        let closeAudio = {
+            if endedWhileDead, !self.isPaused, let file = self.audioFile {
+                self.fillGap(beforePTS: nil, file: file, reason: "до конца звонка системный звук не вернулся")
+            }
+            self.audioFile = nil
+        }
         if let queue = audioQueue {
-            queue.sync { self.audioFile = nil }
+            queue.sync(execute: closeAudio)
         } else {
-            audioFile = nil
+            closeAudio()
         }
 
         // Finalize video
@@ -286,11 +441,24 @@ class SystemAudioRecorder: NSObject {
 
 extension SystemAudioRecorder: SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard isRecording, !isPaused, CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        guard isRecording, CMSampleBufferDataIsReady(sampleBuffer) else { return }
 
         switch type {
         case .audio:
             guard !audioFailed, let audioURL, let pcm = pcmBuffer(from: sampleBuffer) else { return }
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            let end = CMTimeAdd(pts, CMTime(
+                value: CMTimeValue(pcm.frameLength), timescale: CMTimeScale(pcm.format.sampleRate)))
+
+            // A pause takes time out of both tracks on purpose: advance the
+            // timeline without writing, so the pause is never mistaken for an
+            // outage and "filled" back in.
+            if isPaused {
+                lastAudioEnd = end
+                lastAudioWall = Date()
+                fillGapOnNextBuffer = false
+                return
+            }
 
             if audioFile == nil {
                 do {
@@ -313,9 +481,18 @@ extension SystemAudioRecorder: SCStreamOutput {
                 }
             }
 
+            if fillGapOnNextBuffer {
+                fillGapOnNextBuffer = false
+                if let file = audioFile {
+                    fillGap(beforePTS: pts, file: file, reason: "поток перезапускался")
+                }
+            }
+
             do {
                 try audioFile?.write(from: pcm)
                 audioWriteErrorCount = 0
+                lastAudioEnd = end
+                lastAudioWall = Date()
             } catch {
                 audioWriteErrorCount += 1
                 log("[SystemAudioRecorder] ❌ Audio write error (\(audioWriteErrorCount)/\(maxAudioWriteErrors)): \(error.localizedDescription)")
@@ -343,7 +520,7 @@ extension SystemAudioRecorder: SCStreamOutput {
             break // mic is handled by MicRecorder
 
         case .screen:
-            guard !videoFailed else { return }
+            guard !videoFailed, !isPaused else { return }
 
             // Check frame status
             let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]]
@@ -455,6 +632,12 @@ extension SystemAudioRecorder: SCStreamOutput {
 
 extension SystemAudioRecorder: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // A stream we already replaced (or are tearing down) reporting late
+        // must not take the live one down with it.
+        guard stream === self.stream else {
+            log("[SystemAudioRecorder] Old stream reported an error after it was replaced — ignoring: \(error.localizedDescription)")
+            return
+        }
         log("[SystemAudioRecorder] Stream stopped with error: \(error)")
         isRecording = false
         // The frames already appended are only readable once the writer has
@@ -463,9 +646,10 @@ extension SystemAudioRecorder: SCStreamDelegate {
         needsFinalize = true
         // Drop the dead stream here: `stop()` must not spend the session's
         // teardown asking a stream that already stopped itself to stop.
+        // The files stay open — the session may restart the stream into them
+        // (`restartStream()`); the warmup timer stays armed for the same
+        // reason and only fires while a stream is actually delivering.
         self.stream = nil
-        warmupTimer?.cancel()
-        warmupTimer = nil
         DispatchQueue.main.async { [weak self] in
             self?.onStreamError?(error)
         }

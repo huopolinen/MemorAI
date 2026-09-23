@@ -1,4 +1,5 @@
 import Foundation
+import ScreenCaptureKit
 
 /// Orchestrates system audio, mic, and screen recording.
 class RecordingManager {
@@ -36,6 +37,31 @@ class RecordingManager {
     /// would accuse every paused call of being damaged.
     private var pausedSeconds: TimeInterval = 0
     private var pausedSince: Date?
+
+    // --- Keeping the call whole when macOS stops the capture stream ---
+    // macOS stops a running SCStream on its own (-3821 "Stream was stopped by
+    // the system") — on this machine every time CacheDelete asks replayd to
+    // free space on a nearly full disk. Until 1.6.1 that ended the session,
+    // and the call detector, seeing the call still going, started a new one
+    // seconds later: one call came out as five sets of files. Now the stream
+    // is started again into the same files and the session only ends when
+    // the call does.
+    /// The running restart loop, if the stream is currently down.
+    private var streamRecovery: Task<Void, Never>?
+    /// Fast attempts, in seconds after the stream died. After the last one the
+    /// call goes on without the stream (mic, and the tap if it is on), and —
+    /// when the stream carries the far end — keeps trying every
+    /// `streamSlowRetry` seconds for as long as the call lasts.
+    private static let streamRetryDelays: [Double] = [0.5, 1, 2, 4, 8]
+    private static let streamSlowRetry: Double = 30
+    /// A restarted stream that dies again sooner than this continues the
+    /// previous streak of attempts instead of starting a new one — otherwise
+    /// a stream that dies right after every start would be restarted every
+    /// half second forever.
+    private static let streamHealthySeconds: Double = 30
+    private var lastStreamRestart: Date?
+    private var streamAttempt = 0
+    private var streamRestarts = 0
 
     @available(macOS 14.4, *)
     private var tapRecorder: CoreAudioTapRecorder? {
@@ -75,6 +101,11 @@ class RecordingManager {
         self.currentDir = baseDir
         self.pausedSeconds = 0
         self.pausedSince = nil
+        self.streamRecovery?.cancel()
+        self.streamRecovery = nil
+        self.lastStreamRestart = nil
+        self.streamAttempt = 0
+        self.streamRestarts = 0
         self.currentMicURL = micURL
         self.currentSystemURL = sysURL
         self.currentScreenURL = vidURL
@@ -144,10 +175,9 @@ class RecordingManager {
                         // of the call, so the frames taken before the crash are
                         // closed into a playable mp4 within seconds instead of
                         // sitting unfinalized for the next hour.
-                        sysRec.onStreamError = { [weak sysRec] error in
-                            log("[RecordingManager] ⚠️ Видео экрана остановилось: \(error.localizedDescription) — звук продолжает писаться, закрываю видеофайл")
-                            guard let sysRec else { return }
-                            Task { await sysRec.stop() }
+                        sysRec.onStreamError = { [weak self, weak sysRec] error in
+                            guard let self, let sysRec else { return }
+                            self.handleStreamStopped(sysRec, error: error, carriesSystemAudio: false)
                         }
                     } else {
                         // Wire up silence / availability / error signals
@@ -157,10 +187,9 @@ class RecordingManager {
                         sysRec.onSystemAudioUnavailable = { [weak self] in
                             self?.onSystemAudioUnavailable?()
                         }
-                        sysRec.onStreamError = { [weak self] error in
-                            guard let self = self, self.state == .recording || self.state == .starting else { return }
-                            log("[RecordingManager] SCStream error — stopping session: \(error.localizedDescription)")
-                            self.stopRecording(source: "stream-error")
+                        sysRec.onStreamError = { [weak self, weak sysRec] error in
+                            guard let self, let sysRec else { return }
+                            self.handleStreamStopped(sysRec, error: error, carriesSystemAudio: true)
                         }
                     }
                     self.systemAudioRecorder = sysRec
@@ -296,6 +325,8 @@ class RecordingManager {
             mic: currentMicURL, system: currentSystemURL, screen: currentScreenURL)
         currentTag = nil
         currentDir = nil
+        streamRecovery?.cancel()
+        streamRecovery = nil
 
         micRecorder?.stop()
         await systemAudioRecorder?.stop()
@@ -320,6 +351,7 @@ class RecordingManager {
                 "pid": nil,
                 "pid_started": nil,
             ]
+            if streamRestarts > 0 { fields["stream_restarts"] = streamRestarts }
             // Now that the files are closed and their lengths are final, ask
             // whether they are as long as the call was.
             for (key, value) in trackAudit(tag: tag, in: dir, session: session) {
@@ -328,6 +360,88 @@ class RecordingManager {
             SessionMeta.update(tag: tag, in: dir, with: fields)
         }
         return session
+    }
+
+    /// The capture stream died on its own. Keep the call going and bring the
+    /// stream back into the same files; see `streamRecovery`.
+    ///
+    /// Only an explicit "stop sharing" from the user (-3817, the menu-bar
+    /// capture indicator) is taken at its word, as it always was. Everything
+    /// else — -3821 above all — is treated as passing: whether it really is
+    /// shows in whether the restart works.
+    private func handleStreamStopped(
+        _ sysRec: SystemAudioRecorder, error: Error, carriesSystemAudio: Bool
+    ) {
+        guard sysRec === systemAudioRecorder,
+              state == .recording || state == .starting || state == .paused
+        else { return }
+
+        let ns = error as NSError
+        let userStopped = ns.domain == SCStreamErrorDomain
+            && ns.code == SCStreamError.Code.userStopped.rawValue
+        if userStopped {
+            if carriesSystemAudio {
+                log("[RecordingManager] Запись экрана остановлена пользователем — завершаю сессию")
+                stopRecording(source: "stream-error")
+            } else {
+                log("[RecordingManager] Запись экрана остановлена пользователем — звук продолжает писаться, закрываю видеофайл")
+                Task { await sysRec.stop() }
+            }
+            return
+        }
+
+        guard streamRecovery == nil else { return }
+        // A stream that barely lived continues the previous streak.
+        if let last = lastStreamRestart, Date().timeIntervalSince(last) < Self.streamHealthySeconds {
+            // keep streamAttempt
+        } else {
+            streamAttempt = 0
+        }
+        let freeGB = currentDir.flatMap { AudioFormats.freeBytes(at: $0) }
+            .map { String(format: ", на диске свободно %.1f ГБ", Double($0) / 1_073_741_824) } ?? ""
+        log("[RecordingManager] ⚠️ SCStream остановлен (\(ns.domain) \(ns.code): \(ns.localizedDescription)\(freeGB)) — звонок продолжается, перезапускаю поток")
+
+        streamRecovery = Task { @MainActor [weak self, weak sysRec] in
+            while let self, let sysRec, !Task.isCancelled,
+                  sysRec === self.systemAudioRecorder, self.state != .idle, self.state != .stopping {
+                let delays = Self.streamRetryDelays
+                let delay: Double
+                if self.streamAttempt < delays.count {
+                    delay = delays[self.streamAttempt]
+                } else {
+                    if self.streamAttempt == delays.count {
+                        if !carriesSystemAudio {
+                            log("[RecordingManager] ⚠️ SCStream не поднялся за \(delays.count) попыток — звук продолжает писаться (tap + микрофон), закрываю видеофайл")
+                            self.streamRecovery = nil
+                            await sysRec.stop()
+                            return
+                        }
+                        log("[RecordingManager] ⚠️ SCStream не поднялся за \(delays.count) попыток — продолжаю писать микрофон, системный звук пока тишиной; пробую снова каждые \(Int(Self.streamSlowRetry)) с")
+                    }
+                    delay = Self.streamSlowRetry
+                }
+                self.streamAttempt += 1
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } catch {
+                    return  // cancelled: the session ended
+                }
+                guard !Task.isCancelled, sysRec === self.systemAudioRecorder,
+                      self.state != .idle, self.state != .stopping else { return }
+                do {
+                    try await sysRec.restartStream()
+                    guard sysRec.isStreamAlive else { return }
+                    self.streamRestarts += 1
+                    self.lastStreamRestart = Date()
+                    log("[RecordingManager] ✅ SCStream перезапущен (попытка \(self.streamAttempt), перезапусков за звонок: \(self.streamRestarts)) — сессия \(self.currentTag ?? "?") продолжается")
+                    self.streamRecovery = nil
+                    return
+                } catch {
+                    log("[RecordingManager] SCStream не поднялся (попытка \(self.streamAttempt)): \(error.localizedDescription)")
+                }
+            }
+            self?.streamRecovery = nil
+        }
     }
 
     /// Length of every track against the length of the session — see
