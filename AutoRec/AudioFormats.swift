@@ -175,6 +175,14 @@ enum AudioFormats {
         } else if free < 5_368_709_120 {
             log(String(format: "[AudioFormats] ⚠️ Свободно %.1f ГБ (~%.0f ч записи). Запись идёт несжатой до расшифровки.", gb, gb))
         }
+        // Seen on the owner's machine at 5–6 GB free: macOS's CacheDelete asks
+        // replayd to free space and replayd answers by stopping every capture
+        // stream (-3821). The session survives it now (RecordingManager
+        // restarts the stream), but it is the one thing about -3821 the user
+        // can actually change, so it is worth saying before the call.
+        if free < 10_737_418_240 {
+            log(String(format: "[AudioFormats] ⚠️ Свободно %.1f ГБ: при нехватке места macOS периодически останавливает запись экрана (SCStream -3821) — запись переживёт это перезапуском, но видео будет с пропусками.", gb))
+        }
     }
 
     /// Space actually available to us on the volume holding `directory`, in
