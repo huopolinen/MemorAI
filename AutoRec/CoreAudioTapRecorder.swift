@@ -99,6 +99,9 @@ class CoreAudioTapRecorder {
     /// Fires if the capture dies mid-session so the session can be stopped
     /// cleanly instead of leaving the mic recording into a dead file.
     var onStreamError: ((Error) -> Void)?
+    /// Level of every buffer written (RMS, seconds), on the IO queue. Feeds
+    /// the dropout watchdog — see `TrackDropoutDetector`.
+    var onLevel: ((Float, Double) -> Void)?
 
     var isPaused = false
 
@@ -337,6 +340,24 @@ class CoreAudioTapRecorder {
     /// aggregate device nor the file: nothing about the recording is
     /// interrupted. If the system refuses, the existing tap keeps running and
     /// we say so once rather than every ten seconds for an hour.
+    /// Re-point the tap at the call app's processes as they are right now,
+    /// even if the list looks unchanged — the dropout watchdog's answer to a
+    /// tap that went silent while the owner keeps talking. A global tap
+    /// (`callAppOnly == false`) already hears every process; there is nothing
+    /// to re-point, and the watchdog's warning is all that is left.
+    func recycle(reason: String) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self, self.isRecording else { return }
+            guard self.callAppOnly else {
+                log("[CoreAudioTap] \(reason): тап на весь системный звук, пересоздавать нечего")
+                return
+            }
+            log("[CoreAudioTap] \(reason): заново собираю список процессов тапа")
+            self.tappedObjects = []
+            self.refreshScope()
+        }
+    }
+
     private func refreshScope() {
         guard isRecording, callAppOnly, tapID != AudioObjectID(kAudioObjectUnknown) else { return }
 
@@ -473,6 +494,10 @@ class CoreAudioTapRecorder {
         bufferCount += 1
         highestPeak = max(highestPeak, level.peak)
         statsLock.unlock()
+
+        if buffer.format.sampleRate > 0 {
+            onLevel?(level.rms, Double(buffer.frameLength) / buffer.format.sampleRate)
+        }
 
         // Warmup suppresses silence detection until the first audible buffer,
         // so the quiet seconds before anyone speaks don't trigger auto-stop.

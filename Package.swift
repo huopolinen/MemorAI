@@ -11,9 +11,20 @@ let package = Package(
             name: "ObjCSupport",
             path: "ObjCSupport"
         ),
+        // Pure logic with no system frameworks behind it — what can be unit
+        // tested without a microphone, a screen or the GigaAM runtime.
+        .target(
+            name: "MemorAICore",
+            path: "MemorAICore"
+        ),
+        .testTarget(
+            name: "MemorAICoreTests",
+            dependencies: ["MemorAICore"],
+            path: "Tests/MemorAICoreTests"
+        ),
         .executableTarget(
             name: "MemorAI",
-            dependencies: ["ObjCSupport", "TranscribeCppFramework"],
+            dependencies: ["ObjCSupport", "MemorAICore", "TranscribeCppFramework"],
             path: "AutoRec",
             linkerSettings: [
                 .linkedFramework("Cocoa"),

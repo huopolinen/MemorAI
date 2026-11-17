@@ -131,6 +131,9 @@ class MicRecorder {
     // --- Silence detection (mirrors SystemAudioRecorder) ---
     /// Fires on transitions: true = mic silent for silenceDurationThreshold, false = voice resumed.
     var onSilenceChanged: ((Bool) -> Void)?
+    /// Level of every buffer written (RMS, seconds), on the capture thread.
+    /// Feeds the dropout watchdog — see `TrackDropoutDetector`.
+    var onLevel: ((Float, Double) -> Void)?
     private let silenceRMSThreshold: Float = 0.001
     private let silenceDurationThreshold: TimeInterval = 90.0
 
@@ -730,6 +733,15 @@ class MicRecorder {
 
     // MARK: - Restart
 
+    /// Rebuild the engine on request from outside — the dropout watchdog,
+    /// when this track has gone dead while the far end keeps talking.
+    func restart(reason: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRecording, !self.restartPending else { return }
+            self.restartCapture(reason: reason)
+        }
+    }
+
     /// Rebuild the engine on the new route, keeping the file and the wall clock.
     private func restartCapture(reason: String) {
         restartPending = false
@@ -857,6 +869,9 @@ class MicRecorder {
 
     private func updateSilenceState(_ buffer: AVAudioPCMBuffer) {
         let rms = bufferRMS(buffer)
+        if buffer.format.sampleRate > 0 {
+            onLevel?(rms, Double(buffer.frameLength) / buffer.format.sampleRate)
+        }
         let now = Date()
         var transition: Bool?
         withLock {

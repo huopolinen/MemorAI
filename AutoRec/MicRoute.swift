@@ -26,6 +26,21 @@ enum AudioDevices {
         return device
     }
 
+    /// Where the system plays sound right now — where a call's far end goes.
+    static func defaultOutput() -> AudioObjectID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var device = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device
+        ) == noErr, device != AudioObjectID(kAudioObjectUnknown) else { return nil }
+        return device
+    }
+
     static func name(of device: AudioObjectID?) -> String? {
         guard let device, device != AudioObjectID(kAudioObjectUnknown) else { return nil }
         var address = AudioObjectPropertyAddress(

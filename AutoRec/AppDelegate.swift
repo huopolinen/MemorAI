@@ -22,6 +22,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         setupMainMenu()
         requestPermissions()
+        Notifier.shared.prepare()
         settings.ensureOutputDirectory()
 
         // A crash leaves the audio tracks intact but nothing pointing at them:

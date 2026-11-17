@@ -12,6 +12,11 @@ if CommandLine.arguments.contains("--transcribe-pending") {
     BatchTranscriber.run(dateFilter: dateFilter, force: force)
 }
 
+// Report holes in recorded calls (see GapAudit) and exit.
+if CommandLine.arguments.contains("--audit-gaps") {
+    GapAudit.runCLI(CommandLine.arguments)
+}
+
 // Prevent multiple instances
 let runningApps = NSWorkspace.shared.runningApplications.filter {
     $0.bundleIdentifier == "com.local.memorai"
