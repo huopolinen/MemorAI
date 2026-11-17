@@ -78,12 +78,29 @@ final class TrackDropoutScanTests: XCTestCase {
         XCTAssertEqual(gaps.first?.end ?? -1, 250, accuracy: 1)
     }
 
-    /// Under a minute of far-end silence is an ordinary pause even if the
-    /// owner was talking through it.
-    func testShortSilenceIsNotAGap() {
+    /// The owner explaining something for a minute and a half while the
+    /// others listen is an ordinary call, not a hole.
+    func testMonologueIsNotAGap() {
         var (mic, system) = conversation(seconds: 300)
-        for i in 100..<140 { system[i] = Level.zero; mic[i] = Level.speech }
+        for i in 100..<190 { system[i] = Level.zero; mic[i] = Level.speech }
         XCTAssertEqual(TrackDropoutDetector.scan(mic: mic, system: system), [])
+    }
+
+    /// Talking in the room before the call connects: the far end is silent
+    /// from the first second and comes alive later.
+    func testChatterBeforeTheCallIsNotAGap() {
+        var (mic, system) = conversation(seconds: 900)
+        for i in 0..<300 { system[i] = Level.zero }
+        XCTAssertEqual(TrackDropoutDetector.scan(mic: mic, system: system), [])
+    }
+
+    /// A far end that never came through at all is the whole call lost.
+    func testFarEndDeadFromStartToEndIsAGap() {
+        let (mic, _) = conversation(seconds: 600)
+        let system = [Float](repeating: Level.zero, count: 600)
+        let gaps = TrackDropoutDetector.scan(mic: mic, system: system)
+        XCTAssertEqual(gaps.map(\.role), [.system])
+        XCTAssertEqual(gaps.first?.seconds ?? 0, 600, accuracy: 1)
     }
 
     /// A system track that ends early (the capture died and nothing filled
@@ -131,13 +148,13 @@ final class TrackDropoutLiveTests: XCTestCase {
         XCTAssertEqual(restarts.first?.0, 120)
         XCTAssertEqual(restarts.count, 5)
         XCTAssertEqual(restarts.map(\.0), [120, 180, 240, 300, 360])
-        // First warning a minute in, the next one five minutes later.
-        XCTAssertEqual(warns.map(\.0), [160, 460])
+        // First warning a minute and a half in, the next one five minutes later.
+        XCTAssertEqual(warns.map(\.0), [190, 490])
         guard let firstWarn = warns.first else { return XCTFail("no warning at all") }
         if case let .warn(role, deadFor, voiced) = firstWarn.1 {
             XCTAssertEqual(role, .system)
-            XCTAssertEqual(deadFor, 60, accuracy: 0.5)
-            XCTAssertGreaterThanOrEqual(voiced, 15)
+            XCTAssertEqual(deadFor, 90, accuracy: 0.5)
+            XCTAssertGreaterThanOrEqual(voiced, 20)
         } else { XCTFail() }
 
         events = run(d, from: 500, to: 510, mic: talk, system: { _ in Level.speech })
@@ -161,7 +178,7 @@ final class TrackDropoutLiveTests: XCTestCase {
         let d = TrackDropoutDetector(roles: [.mic, .system], start: 0)
         let talk: (Int) -> Float = { ($0 / 6) % 2 == 0 ? Level.speech : Level.roomNoise }
         _ = run(d, from: 0, to: 30, mic: talk, system: { _ in Level.speech })
-        let events = run(d, from: 30, to: 120, mic: talk, system: { _ in nil })
+        let events = run(d, from: 30, to: 140, mic: talk, system: { _ in nil })
         guard case let .restart(role, deadFor, attempt)? = events.first?.1 else {
             return XCTFail("expected a restart, got \(events)")
         }
