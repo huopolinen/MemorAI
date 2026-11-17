@@ -59,6 +59,10 @@ public struct DropoutPolicy: Sendable {
     public var warnEvery: Double
     /// A stretch this long, with the other side talking at least
     /// `gapMinOtherVoice` seconds through it, is a hole in the recording.
+    /// Two minutes, not one: over the October–November archive a one-minute
+    /// line flagged a quarter of all calls, mostly the owner explaining
+    /// something for a minute while everyone else listened in silence. The
+    /// failures that cost a call were all many minutes long.
     public var gapMinSeconds: Double
     public var gapMinOtherVoice: Double
     /// No buffer for this long counts as dead too: a capture that stopped
@@ -91,8 +95,8 @@ public struct DropoutPolicy: Sendable {
         voiceRMS: 0.016,                             // -36 dBFS
         restartAfter: 20, restartMinOtherVoice: 5,
         restartEvery: 60, maxRestartsPerStretch: 5,
-        warnAfter: 60, warnMinOtherVoice: 15, warnEvery: 300,
-        gapMinSeconds: 60, gapMinOtherVoice: 15,
+        warnAfter: 90, warnMinOtherVoice: 20, warnEvery: 300,
+        gapMinSeconds: 120, gapMinOtherVoice: 30,
         staleAfter: 5
     )
 }
@@ -270,6 +274,11 @@ public final class TrackDropoutDetector {
             if let mic { detector.feed(.mic, rms: i < mic.count ? mic[i] : 0, seconds: step, at: t) }
             if let system { detector.feed(.system, rms: i < system.count ? system[i] : 0, seconds: step, at: t) }
         }
-        return detector.finish(at: Double(count) * step)
+        let total = Double(count) * step
+        // Silence from the very first second that ends later in the call is
+        // the call not having started yet — chatting in the room before the
+        // others join — not a capture that broke. A far end that is dead from
+        // the first second to the last is still a hole.
+        return detector.finish(at: total).filter { !($0.start <= step && $0.end < total) }
     }
 }
