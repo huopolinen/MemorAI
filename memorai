@@ -757,6 +757,10 @@ Commands:
     engine gigaam|whisper_local|groq|gemini
     language ru|en|auto
 
+  gaps [--since YYYY-MM-DD] [--tag call_…] [--write]
+                            Find calls where one track went dead while the
+                            other kept talking; --write leaves <tag>_gaps.json
+                            beside the call, which keeps its originals
   exclude add <bundle-id>   Add app to exclusion list
   exclude remove <bundle-id>  Remove app from exclusion list
   exclude list              List excluded apps
@@ -773,6 +777,7 @@ case "${1:-help}" in
     restart)      cmd_restart ;;
     sessions)     cmd_sessions ;;
     repair-speed) shift; cmd_repair_speed "$@" ;;
+    gaps)         shift; "$APP_PATH/Contents/MacOS/MemorAI" --audit-gaps --dir "$(get_output_path)" "$@" ;;
     screenshots)  cmd_screenshots "$2" ;;
     clipboard)    cmd_clipboard "$2" ;;
     ocr)          cmd_ocr "$2" "$3" ;;

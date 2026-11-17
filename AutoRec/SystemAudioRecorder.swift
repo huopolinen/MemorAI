@@ -95,7 +95,25 @@ class SystemAudioRecorder: NSObject {
     /// open: the owner decides whether to `restartStream()` into them or to
     /// `stop()` and close them.
     var onStreamError: ((Error) -> Void)?
+    /// Level of every audio buffer written (RMS, seconds), on the audio
+    /// queue. Feeds the dropout watchdog — see `TrackDropoutDetector`.
+    var onLevel: ((Float, Double) -> Void)?
     private let silenceRMSThreshold: Float = 0.001
+
+    /// Test hook, inert unless the environment asks for it:
+    /// `MEMORAI_TEST_SYSTEM_DROPOUT=<seconds>` turns the far-end track into
+    /// exact zeros that many seconds after the stream starts — the 16.11
+    /// failure, on demand — until the stream is recycled; with a trailing `!`
+    /// the zeros survive recycling too, so the owner warning can be seen.
+    /// Launch with `open -n --env MEMORAI_TEST_SYSTEM_DROPOUT=25 /Applications/MemorAI.app`.
+    private static let testDropout: (after: Double, sticky: Bool)? = {
+        guard var raw = ProcessInfo.processInfo.environment["MEMORAI_TEST_SYSTEM_DROPOUT"] else { return nil }
+        let sticky = raw.hasSuffix("!")
+        if sticky { raw.removeLast() }
+        guard let after = Double(raw) else { return nil }
+        return (after, sticky)
+    }()
+    private var testDropoutCleared = false
     private let silenceDurationThreshold: TimeInterval = 90.0
     private var silenceStart: Date?
     private var isSilent = false
@@ -184,6 +202,10 @@ class SystemAudioRecorder: NSObject {
         self.lastAudioWall = nil
         self.fillGapOnNextBuffer = false
         self.needsFinalize = false
+        self.testDropoutCleared = false
+        if let test = Self.testDropout {
+            log("[SystemAudioRecorder] [test] MEMORAI_TEST_SYSTEM_DROPOUT: через \(Int(test.after)) с дорожка собеседника станет нулями\(test.sticky ? " и останется ими" : " до пересоздания потока")")
+        }
 
         let stream = try makeStream(display: display, config: config)
         self.stream = stream
@@ -258,6 +280,39 @@ class SystemAudioRecorder: NSObject {
         }
         isRecording = true
         log("[SystemAudioRecorder] Stream restarted — дописываю в те же файлы (\(audioURL?.lastPathComponent ?? "без звука"), \(videoURL?.lastPathComponent ?? "без видео"))")
+    }
+
+    /// Replace a stream that is alive but no longer hears anything.
+    ///
+    /// This is the failure `restartStream()` was never asked to handle: on
+    /// 16.11 the stream kept delivering — exact zeros — for the last sixteen
+    /// minutes of a call while the far end was talking, and since nothing
+    /// stopped, nothing restarted it. A new SCStream builds its audio capture
+    /// afresh against the processes and devices of *now*, so it is the
+    /// cheapest thing that can bring the far end back. The files stay open and
+    /// the moment of the swap is filled with silence like any other restart.
+    /// Throws when the new stream cannot be started — the old one is gone by
+    /// then, and the caller's ordinary recovery loop takes over.
+    func recycleStream(reason: String) async throws {
+        guard sessionActive, isRecording, let old = stream else { return }
+        log("[SystemAudioRecorder] Пересоздаю поток (\(reason))")
+        // Buffers still in flight from the old stream must not be written
+        // after the gap marker is set; dropping them costs a few ms.
+        isRecording = false
+        stream = nil
+        do { try await old.stopCapture() } catch {
+            log("[SystemAudioRecorder] stopCapture старого потока: \(error.localizedDescription)")
+        }
+        if let audioQueue {
+            audioQueue.sync {
+                self.silenceStart = nil
+                if let test = Self.testDropout, !test.sticky, !self.testDropoutCleared {
+                    self.testDropoutCleared = true
+                    log("[SystemAudioRecorder] [test] искусственная тишина снята пересозданием потока")
+                }
+            }
+        }
+        try await restartStream()
     }
 
     /// Write the stretch of the call the far-end track missed as silence, so
@@ -446,6 +501,14 @@ extension SystemAudioRecorder: SCStreamOutput {
         switch type {
         case .audio:
             guard !audioFailed, let audioURL, let pcm = pcmBuffer(from: sampleBuffer) else { return }
+            var injectedSilence = false
+            if let test = Self.testDropout, !testDropoutCleared, let started = streamStartedAt,
+               Date().timeIntervalSince(started) >= test.after, let channels = pcm.floatChannelData {
+                for ch in 0..<Int(pcm.format.channelCount) {
+                    channels[ch].update(repeating: 0, count: Int(pcm.frameLength))
+                }
+                injectedSilence = true
+            }
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             let end = CMTimeAdd(pts, CMTime(
                 value: CMTimeValue(pcm.frameLength), timescale: CMTimeScale(pcm.format.sampleRate)))
@@ -503,18 +566,20 @@ extension SystemAudioRecorder: SCStreamOutput {
                 return
             }
 
+            let rms = injectedSilence ? 0 : bufferRMS(sampleBuffer)
+            onLevel?(rms, Double(pcm.frameLength) / pcm.format.sampleRate)
+
             // Warmup suppresses silence detection for the first non-silent buffer, so the
             // ~30s of digital silence SCStream emits at startup doesn't trigger auto-stop.
             // We always write the buffer so the audio track never finalizes empty.
             if !audioWarmedUp {
-                let rms = bufferRMS(sampleBuffer)
                 if rms >= warmupRMSThreshold {
                     audioWarmedUp = true
                     log("[SystemAudioRecorder] Audio warmed up (first non-silent buffer)")
                 }
                 return
             }
-            updateSilenceState(sampleBuffer)
+            updateSilenceState(rms: rms)
 
         case .microphone:
             break // mic is handled by MicRecorder
@@ -603,8 +668,7 @@ extension SystemAudioRecorder: SCStreamOutput {
     }
 
     /// Track silence duration using RMS.
-    private func updateSilenceState(_ sampleBuffer: CMSampleBuffer) {
-        let rms = bufferRMS(sampleBuffer)
+    private func updateSilenceState(rms: Float) {
         let now = Date()
         if rms < silenceRMSThreshold {
             if silenceStart == nil {

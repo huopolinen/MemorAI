@@ -1,4 +1,6 @@
+import CoreAudio
 import Foundation
+import MemorAICore
 import ScreenCaptureKit
 
 /// Orchestrates system audio, mic, and screen recording.
@@ -62,6 +64,23 @@ class RecordingManager {
     private var lastStreamRestart: Date?
     private var streamAttempt = 0
     private var streamRestarts = 0
+
+    // --- Keeping both halves of the call while it is still going ---
+    // A capture can stay "alive" and hear nothing: on 16.11 SCStream
+    // delivered exact zeros for the last sixteen minutes of a call while the
+    // far end was talking, raised no error, and the stream recovery above
+    // never ran. The watchdog listens to both tracks' levels and, when one is
+    // dead while the other talks, first rebuilds that capture and then, if
+    // that did not help, tells the owner while the call can still be saved.
+    // See `TrackDropoutDetector` for the rule itself.
+    private var dropout: TrackDropoutDetector?
+    private let dropoutLock = NSLock()
+    private var dropoutTimer: DispatchSourceTimer?
+    private var dropoutRestarts = 0
+    private var dropoutWarnings = 0
+    private var warnedRoles = Set<TrackRole>()
+    private var outputListener: AudioObjectPropertyListenerBlock?
+    private var outputDevice: AudioObjectID?
 
     @available(macOS 14.4, *)
     private var tapRecorder: CoreAudioTapRecorder? {
@@ -143,6 +162,9 @@ class RecordingManager {
                         tap.onSystemAudioUnavailable = { [weak self] in
                             self?.onSystemAudioUnavailable?()
                         }
+                        tap.onLevel = { [weak self] rms, seconds in
+                            self?.feedLevel(.system, rms, seconds)
+                        }
                         tap.onStreamError = { [weak self] error in
                             guard let self = self, self.state == .recording || self.state == .starting else { return }
                             log("[RecordingManager] Core Audio tap error — stopping session: \(error.localizedDescription)")
@@ -191,6 +213,9 @@ class RecordingManager {
                             guard let self, let sysRec else { return }
                             self.handleStreamStopped(sysRec, error: error, carriesSystemAudio: true)
                         }
+                        sysRec.onLevel = { [weak self] rms, seconds in
+                            self?.feedLevel(.system, rms, seconds)
+                        }
                     }
                     self.systemAudioRecorder = sysRec
                     do {
@@ -212,6 +237,9 @@ class RecordingManager {
                 micRec.onSilenceChanged = { [weak self] silent in
                     self?.onMicSilenceChanged?(silent)
                 }
+                micRec.onLevel = { [weak self] rms, seconds in
+                    self?.feedLevel(.mic, rms, seconds)
+                }
                 self.micRecorder = micRec
                 // A mic failure must not tear down the (already running) system-audio
                 // recording — degrade to a system-only session instead.
@@ -229,6 +257,7 @@ class RecordingManager {
 
                 setState(.recording)
                 log("[RecordingManager] All recorders running")
+                self.startDropoutWatch(withMic: self.micRecorder != nil)
             } catch {
                 log("[RecordingManager] ❌ Failed to start: \(error)")
                 await systemAudioRecorder?.stop()
@@ -264,6 +293,9 @@ class RecordingManager {
         if #available(macOS 14.4, *) { tapRecorder?.isPaused = false }
         micRecorder?.isPaused = false
         closeOpenPause()
+        dropoutLock.lock()
+        dropout?.reset(at: Self.uptime())
+        dropoutLock.unlock()
         setState(.recording)
         log("[RecordingManager] Resumed")
     }
@@ -327,6 +359,7 @@ class RecordingManager {
         currentDir = nil
         streamRecovery?.cancel()
         streamRecovery = nil
+        stopDropoutWatch()
 
         micRecorder?.stop()
         await systemAudioRecorder?.stop()
@@ -352,14 +385,197 @@ class RecordingManager {
                 "pid_started": nil,
             ]
             if streamRestarts > 0 { fields["stream_restarts"] = streamRestarts }
+            if dropoutRestarts > 0 { fields["dropout_restarts"] = dropoutRestarts }
+            if dropoutWarnings > 0 { fields["dropout_warnings"] = dropoutWarnings }
             // Now that the files are closed and their lengths are final, ask
             // whether they are as long as the call was.
             for (key, value) in trackAudit(tag: tag, in: dir, session: session) {
                 fields[key] = value
             }
             SessionMeta.update(tag: tag, in: dir, with: fields)
+
+            // Before anything downstream can archive the originals: is either
+            // track missing a stretch of the call? Skipped on quit — the next
+            // launch reaches the same audit through `TrackCompressor`.
+            if source != "app-quit", let gaps = GapAudit.ensureAudited(tag: tag, in: dir), !gaps.isEmpty {
+                let summary = GapAudit.summary(gaps)
+                Notifier.shared.post(
+                    title: "MemorAI: в записи звонка дыра",
+                    body: summary.prefix(1).uppercased() + summary.dropFirst()
+                        + ". Исходники и видео сохранены, отметка — \(tag)_gaps.json",
+                    id: "gaps-\(tag)")
+            }
         }
         return session
+    }
+
+    // MARK: - Dropout watchdog
+
+    private static func uptime() -> Double { ProcessInfo.processInfo.systemUptime }
+
+    /// Called from the recorders' own queues, buffer by buffer.
+    private func feedLevel(_ role: TrackRole, _ rms: Float, _ seconds: Double) {
+        dropoutLock.lock()
+        dropout?.feed(role, rms: rms, seconds: seconds, at: Self.uptime())
+        dropoutLock.unlock()
+    }
+
+    private func startDropoutWatch(withMic: Bool) {
+        let roles: Set<TrackRole> = withMic ? [.mic, .system] : [.system]
+        dropoutLock.lock()
+        dropout = TrackDropoutDetector(roles: roles, start: Self.uptime())
+        dropoutLock.unlock()
+        dropoutRestarts = 0
+        dropoutWarnings = 0
+        warnedRoles = []
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in self?.checkDropout() }
+        timer.resume()
+        dropoutTimer = timer
+
+        outputDevice = AudioDevices.defaultOutput()
+        log("[RecordingManager] Выход звука: \(AudioDevices.name(of: outputDevice) ?? "?")")
+        listenForOutputChanges()
+    }
+
+    private func stopDropoutWatch() {
+        dropoutTimer?.cancel()
+        dropoutTimer = nil
+        stopListeningForOutputChanges()
+        dropoutLock.lock()
+        dropout = nil
+        dropoutLock.unlock()
+    }
+
+    private func checkDropout() {
+        guard state == .recording else { return }
+        dropoutLock.lock()
+        let events = dropout?.evaluate(now: Self.uptime()) ?? []
+        dropoutLock.unlock()
+        for event in events { handle(event) }
+    }
+
+    private func handle(_ event: DropoutEvent) {
+        let tag = currentTag ?? "?"
+        switch event {
+        case let .restart(role, deadFor, attempt):
+            dropoutRestarts += 1
+            let what = role == .system ? "собеседник" : "микрофон"
+            recycleCapture(role, reason: String(
+                format: "%@ молчит %.0f с, а другая дорожка говорит — переподхват, попытка %d",
+                what, deadFor, attempt))
+
+        case let .warn(role, deadFor, otherVoiced):
+            dropoutWarnings += 1
+            warnedRoles.insert(role)
+            let minutes = max(1, Int((deadFor / 60).rounded()))
+            log(String(format: "[RecordingManager] ⚠️⚠️ %@: дорожка «%@» мертва %.0f с, другая говорила %.0f с — переподхват не помог, предупреждаю",
+                       tag, role.rawValue, deadFor, otherVoiced))
+            if role == .system {
+                Notifier.shared.post(
+                    title: "MemorAI: не пишется собеседник",
+                    body: "Уже \(minutes) мин в записи нет голоса собеседника, хотя вы говорите. "
+                        + "Перезапуск захвата не помог — проверьте вывод звука. Исходники звонка сохраню",
+                    id: "dropout-\(tag)-system")
+            } else {
+                Notifier.shared.post(
+                    title: "MemorAI: не пишется микрофон",
+                    body: "Уже \(minutes) мин ваш микрофон пишет тишину, хотя собеседник говорит. "
+                        + "Перезапуск захвата не помог — проверьте микрофон. Исходники звонка сохраню",
+                    id: "dropout-\(tag)-mic")
+            }
+
+        case let .recovered(role, deadFor):
+            log(String(format: "[RecordingManager] ✅ %@: дорожка «%@» снова пишет звук (молчала %.0f с)",
+                       tag, role.rawValue, deadFor))
+            if warnedRoles.remove(role) != nil {
+                Notifier.shared.post(
+                    title: role == .system ? "MemorAI: собеседник снова пишется" : "MemorAI: микрофон снова пишется",
+                    body: String(format: "Звук вернулся после %.0f мин тишины", deadFor / 60),
+                    id: "dropout-\(tag)-\(role.rawValue)")
+            }
+        }
+    }
+
+    /// Rebuild the capture of one track without ending the session or its
+    /// files.
+    private func recycleCapture(_ role: TrackRole, reason: String) {
+        log("[RecordingManager] ⚠️ \(reason)")
+        if role == .mic {
+            micRecorder?.restart(reason: reason)
+            return
+        }
+        if #available(macOS 14.4, *), let tap = tapRecorder {
+            tap.recycle(reason: reason)
+            return
+        }
+        guard let sysRec = systemAudioRecorder, streamRecovery == nil, sysRec.isStreamAlive else {
+            log("[RecordingManager] Поток системного звука уже перезапускается — жду")
+            return
+        }
+        Task { @MainActor [weak self, weak sysRec] in
+            guard let sysRec else { return }
+            do {
+                try await sysRec.recycleStream(reason: reason)
+                if sysRec.isStreamAlive {
+                    log("[RecordingManager] ✅ Поток системного звука пересоздан — сессия \(self?.currentTag ?? "?") продолжается")
+                }
+            } catch {
+                guard let self else { return }
+                self.handleStreamStopped(sysRec, error: error, carriesSystemAudio: true)
+            }
+        }
+    }
+
+    /// The far end is played into the default output, and on this machine
+    /// that is what moves under a call: AirPods connecting, a headset
+    /// switching profile. Every change is logged — the 16.11 investigation
+    /// had nothing to go on — and if the far end has gone quiet since, its
+    /// capture is rebuilt without waiting for the watchdog's longer timers.
+    private func listenForOutputChanges() {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.outputChanged()
+        }
+        if AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main, listener) == noErr {
+            outputListener = listener
+        }
+    }
+
+    private func stopListeningForOutputChanges() {
+        guard let listener = outputListener else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main, listener)
+        outputListener = nil
+    }
+
+    private func outputChanged() {
+        let now = AudioDevices.defaultOutput()
+        guard now != outputDevice else { return }
+        let was = AudioDevices.name(of: outputDevice) ?? "?"
+        outputDevice = now
+        let name = AudioDevices.name(of: now) ?? "?"
+        log("[RecordingManager] Выход звука сменился: \(was) → \(name)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self, self.state == .recording else { return }
+            self.dropoutLock.lock()
+            let dead = self.dropout?.deadFor(.system, now: Self.uptime())
+            self.dropoutLock.unlock()
+            guard let dead, dead >= 3 else { return }
+            self.dropoutRestarts += 1
+            self.recycleCapture(.system, reason: String(
+                format: "после смены выхода звука на %@ собеседник молчит %.0f с — переподхват", name, dead))
+        }
     }
 
     /// The capture stream died on its own. Keep the call going and bring the

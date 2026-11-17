@@ -22,6 +22,20 @@ enum TrackCompressor {
     /// Safe to call more than once: a session that is already archived has no
     /// .caf files left to compress and falls straight through.
     static func settleAfterTranscript(tag: String, in directory: URL) {
+        // The originals are the only full-quality copy of the call. Before
+        // they can go, the tracks are checked for holes — a stretch where one
+        // side went dead while the other talked (16.11: half a call lost, and
+        // the .caf compressed away before anyone looked). A hole is a hold:
+        // nothing is archived while `<tag>_gaps.json` is there.
+        if !pcmTracks(tag: tag, in: directory).isEmpty {
+            GapAudit.ensureAudited(tag: tag, in: directory)
+        }
+        if GapAudit.hasGaps(tag: tag, in: directory) {
+            if !pcmTracks(tag: tag, in: directory).isEmpty {
+                log("[TrackCompressor] \(tag): в записи отмечены дыры (\(GapAudit.markerURL(tag: tag, in: directory).lastPathComponent)) — исходники .caf не сжимаю и не удаляю")
+            }
+            return
+        }
         guard SessionMeta.hasTranscript(tag: tag, in: directory) else {
             let pcm = pcmTracks(tag: tag, in: directory)
             if !pcm.isEmpty {
