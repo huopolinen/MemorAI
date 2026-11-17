@@ -23,6 +23,9 @@ KEYCHAIN_PROFILE="memorai-notary"
 cd "$(dirname "$0")"
 source ./bundle-lib.sh
 
+echo "[0/7] Checking sources for recording-off hooks…"
+./tools/check-no-recording-sabotage.sh
+
 echo "[1/7] Verifying signing identity…"
 if ! security find-identity -v -p codesigning | grep -q "Developer ID Application: NEO, OOO"; then
     echo "❌ Developer ID Application cert not found in keychain. Create one at developer.apple.com first."

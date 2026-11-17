@@ -24,8 +24,19 @@ fi
 cd "$DIR" || { echo "dir not found: $DIR" >&2; exit 1; }
 
 shopt -s nullglob
-mp4s=( *_screen.mp4 )
+all_mp4s=( *_screen.mp4 )
 shopt -u nullglob
+
+# A call with <tag>_gaps.json lost part of an audio track; its video is the
+# only full copy of the talk and stays untouched, bit for bit.
+mp4s=()
+for f in ${all_mp4s[@]+"${all_mp4s[@]}"}; do
+    if [[ -e "${f%_screen.mp4}_gaps.json" ]]; then
+        echo "skip (call has holes, ${f%_screen.mp4}_gaps.json): $f"
+        continue
+    fi
+    mp4s+=( "$f" )
+done
 
 if [[ ${#mp4s[@]} -eq 0 ]]; then
     echo "no *_screen.mp4 files in $DIR"

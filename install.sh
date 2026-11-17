@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# No way to switch recording off or spoil it may ship (docs/decisions.md, 2026-11-17).
+"$(dirname "$0")/tools/check-no-recording-sabotage.sh"
+
 echo "=== MemorAI Installer ==="
 echo ""
 

@@ -19,6 +19,9 @@ if [ -z "${SIGN_IDENTITY:-}" ]; then
     SIGN_IDENTITY="-"
 fi
 
+# No way to switch recording off or spoil it may ship (docs/decisions.md, 2026-11-17).
+./tools/check-no-recording-sabotage.sh
+
 echo "Building MemorAI..."
 swift build -c release 2>&1
 

@@ -100,20 +100,6 @@ class SystemAudioRecorder: NSObject {
     var onLevel: ((Float, Double) -> Void)?
     private let silenceRMSThreshold: Float = 0.001
 
-    /// Test hook, inert unless the environment asks for it:
-    /// `MEMORAI_TEST_SYSTEM_DROPOUT=<seconds>` turns the far-end track into
-    /// exact zeros that many seconds after the stream starts — the 16.11
-    /// failure, on demand — until the stream is recycled; with a trailing `!`
-    /// the zeros survive recycling too, so the owner warning can be seen.
-    /// Launch with `open -n --env MEMORAI_TEST_SYSTEM_DROPOUT=25 /Applications/MemorAI.app`.
-    private static let testDropout: (after: Double, sticky: Bool)? = {
-        guard var raw = ProcessInfo.processInfo.environment["MEMORAI_TEST_SYSTEM_DROPOUT"] else { return nil }
-        let sticky = raw.hasSuffix("!")
-        if sticky { raw.removeLast() }
-        guard let after = Double(raw) else { return nil }
-        return (after, sticky)
-    }()
-    private var testDropoutCleared = false
     private let silenceDurationThreshold: TimeInterval = 90.0
     private var silenceStart: Date?
     private var isSilent = false
@@ -202,10 +188,6 @@ class SystemAudioRecorder: NSObject {
         self.lastAudioWall = nil
         self.fillGapOnNextBuffer = false
         self.needsFinalize = false
-        self.testDropoutCleared = false
-        if let test = Self.testDropout {
-            log("[SystemAudioRecorder] [test] MEMORAI_TEST_SYSTEM_DROPOUT: через \(Int(test.after)) с дорожка собеседника станет нулями\(test.sticky ? " и останется ими" : " до пересоздания потока")")
-        }
 
         let stream = try makeStream(display: display, config: config)
         self.stream = stream
@@ -304,13 +286,7 @@ class SystemAudioRecorder: NSObject {
             log("[SystemAudioRecorder] stopCapture старого потока: \(error.localizedDescription)")
         }
         if let audioQueue {
-            audioQueue.sync {
-                self.silenceStart = nil
-                if let test = Self.testDropout, !test.sticky, !self.testDropoutCleared {
-                    self.testDropoutCleared = true
-                    log("[SystemAudioRecorder] [test] искусственная тишина снята пересозданием потока")
-                }
-            }
+            audioQueue.sync { self.silenceStart = nil }
         }
         try await restartStream()
     }
@@ -501,14 +477,6 @@ extension SystemAudioRecorder: SCStreamOutput {
         switch type {
         case .audio:
             guard !audioFailed, let audioURL, let pcm = pcmBuffer(from: sampleBuffer) else { return }
-            var injectedSilence = false
-            if let test = Self.testDropout, !testDropoutCleared, let started = streamStartedAt,
-               Date().timeIntervalSince(started) >= test.after, let channels = pcm.floatChannelData {
-                for ch in 0..<Int(pcm.format.channelCount) {
-                    channels[ch].update(repeating: 0, count: Int(pcm.frameLength))
-                }
-                injectedSilence = true
-            }
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             let end = CMTimeAdd(pts, CMTime(
                 value: CMTimeValue(pcm.frameLength), timescale: CMTimeScale(pcm.format.sampleRate)))
@@ -566,7 +534,7 @@ extension SystemAudioRecorder: SCStreamOutput {
                 return
             }
 
-            let rms = injectedSilence ? 0 : bufferRMS(sampleBuffer)
+            let rms = bufferRMS(sampleBuffer)
             onLevel?(rms, Double(pcm.frameLength) / pcm.format.sampleRate)
 
             // Warmup suppresses silence detection for the first non-silent buffer, so the
