@@ -133,14 +133,15 @@ final class TrackDropoutLiveTests: XCTestCase {
         XCTAssertEqual(restarts.map(\.0), [120, 180, 240, 300, 360])
         // First warning a minute in, the next one five minutes later.
         XCTAssertEqual(warns.map(\.0), [160, 460])
-        if case let .warn(role, deadFor, voiced) = warns[0].1 {
+        guard let firstWarn = warns.first else { return XCTFail("no warning at all") }
+        if case let .warn(role, deadFor, voiced) = firstWarn.1 {
             XCTAssertEqual(role, .system)
             XCTAssertEqual(deadFor, 60, accuracy: 0.5)
             XCTAssertGreaterThanOrEqual(voiced, 15)
         } else { XCTFail() }
 
         events = run(d, from: 500, to: 510, mic: talk, system: { _ in Level.speech })
-        XCTAssertEqual(events.count, 1)
+        guard events.count == 1 else { return XCTFail("expected one recovery, got \(events)") }
         if case let .recovered(role, deadFor) = events[0].1 {
             XCTAssertEqual(role, .system)
             XCTAssertEqual(deadFor, 400, accuracy: 1)
@@ -175,7 +176,10 @@ final class TrackDropoutLiveTests: XCTestCase {
     func testResetAfterPauseForgetsTheStretch() {
         let d = TrackDropoutDetector(roles: [.mic, .system], start: 0)
         let talk: (Int) -> Float = { ($0 / 6) % 2 == 0 ? Level.speech : Level.roomNoise }
-        _ = run(d, from: 0, to: 15, mic: talk, system: { _ in Level.zero })
+        // Dead long enough for a restart before the pause...
+        let before = run(d, from: 0, to: 30, mic: talk, system: { _ in Level.zero })
+        XCTAssertEqual(before.count, 1, "\(before)")
+        // ...and after it, nothing about that stretch is reported back.
         d.reset(at: 300)
         let events = run(d, from: 300, to: 310, mic: talk, system: { _ in Level.speech })
         XCTAssertTrue(events.isEmpty, "\(events)")
