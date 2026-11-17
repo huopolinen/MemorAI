@@ -135,6 +135,8 @@ enum GapAudit {
     /// `--write` is given. Exists for checking the detector against the real
     /// archive, and for re-auditing an old call by hand.
     static func runCLI(_ args: [String]) -> Never {
+        // One line per call as it is judged, even into a pipe or a file.
+        setvbuf(stdout, nil, _IOLBF, 0)
         func value(after flag: String) -> String? {
             guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
             return args[i + 1]
