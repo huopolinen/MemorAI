@@ -1,8 +1,9 @@
 import AVFoundation
 import Foundation
+import MemorAICore
 
-/// Turns a finished session's uncompressed PCM tracks into AAC — but only once
-/// the transcript exists.
+/// Turns a finished session's uncompressed PCM tracks into AAC, and deletes the
+/// PCM only once the transcript exists.
 ///
 /// Recording writes PCM because that is the only format that survives a hard
 /// kill (see `AudioFormats`), at about a gigabyte an hour across both tracks.
@@ -10,10 +11,12 @@ import Foundation
 /// an archive, so the PCM is traded for AAC as soon as it has done its job.
 ///
 /// The order is the whole safety argument and is not negotiable: transcript
-/// first, then compression. A session that failed to transcribe — engine not
-/// configured, network down, the call too quiet — never reaches this code, and
-/// keeps its .caf files forever. That recording is the only copy of the call,
-/// and a later retry is all it has.
+/// first, then deleting the original. A session that failed to transcribe —
+/// engine not configured, network down, track lengths unreadable — still gets
+/// its .m4a copy (18.11: a 49-minute call sat as 850 MB of .caf with no
+/// playable copy because the copy waited for a transcript that never came),
+/// but keeps its .caf files until a retry produces the transcript. The
+/// decision itself is `ArchivePlan` in MemorAICore.
 ///
 /// подход из amanu (MIT, gsamat/amanu): Audio/TrackCompressor.swift
 enum TrackCompressor {
@@ -30,18 +33,32 @@ enum TrackCompressor {
         if !pcmTracks(tag: tag, in: directory).isEmpty {
             GapAudit.ensureAudited(tag: tag, in: directory)
         }
-        if GapAudit.hasGaps(tag: tag, in: directory) {
+        let plan = ArchivePlan.decide(
+            hasPCM: !pcmTracks(tag: tag, in: directory).isEmpty,
+            hasTranscript: SessionMeta.hasTranscript(tag: tag, in: directory),
+            hasGaps: GapAudit.hasGaps(tag: tag, in: directory))
+        switch plan {
+        case .hold:
             if !pcmTracks(tag: tag, in: directory).isEmpty {
                 log("[TrackCompressor] \(tag): в записи отмечены дыры (\(GapAudit.markerURL(tag: tag, in: directory).lastPathComponent)) — исходники .caf не сжимаю и не удаляю")
             }
             return
-        }
-        guard SessionMeta.hasTranscript(tag: tag, in: directory) else {
-            let pcm = pcmTracks(tag: tag, in: directory)
-            if !pcm.isEmpty {
-                log("[TrackCompressor] \(tag): транскрипта нет — оставляю \(pcm.count) несжатую дорожку(и). Это единственная копия звонка.")
+        case .copyKeepOriginal:
+            // No transcript (yet): the call still gets its compact copy, and
+            // the .caf stays as the lossless source for the retry.
+            var copies = 0
+            for (role, source) in pcmTracks(tag: tag, in: directory) {
+                do {
+                    _ = try compress(track: source)
+                    copies += 1
+                } catch {
+                    log("[TrackCompressor] ⚠️ \(tag)/\(role): сжатие не удалось (\(error.localizedDescription)) — оставляю \(source.lastPathComponent)")
+                }
             }
+            log("[TrackCompressor] \(tag): транскрипта нет — m4a сделано для \(copies) дорожки(ек), исходники .caf оставляю до расшифровки")
             return
+        case .archive:
+            break
         }
 
         var archived: [String: String] = [:]
@@ -113,6 +130,13 @@ enum TrackCompressor {
             .appendingPathExtension(AudioFormats.archiveExtension)
         let temporary = source.deletingPathExtension()
             .appendingPathExtension("tmp.\(AudioFormats.archiveExtension)")
+
+        // A copy made earlier (before the transcript existed) is reused when
+        // it is as long as the source — the same check a fresh encode gets.
+        if let existing = try? AVAudioFile(forReading: destination), existing.length > 0,
+           Double(existing.length) / existing.processingFormat.sampleRate >= sourceSeconds * 0.99 {
+            return destination
+        }
         try? FileManager.default.removeItem(at: temporary)
 
         // HE-AAC is what the system-audio track has always been encoded with
